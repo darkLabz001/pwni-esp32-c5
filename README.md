@@ -13,7 +13,7 @@
 
 - **Passive dual-band sniffer** — promiscuous 2.4 GHz + 5 GHz capture with 802.11 management/data parsing.
 - **Handshake and PMKID capture** — EAPOL M1–M4 classification, RSN PMKID extraction, per `(BSSID, STA)` slots, deduplication, and PCAP output.
-- **microSD storage** — PCAPs written to `/sdcard/handshakes/`; the card is mounted at 10 MHz because the LCD and SD share one SPI bus. Web/SET show free space and a **Remount SD** action; writes are atomic (temp + rename) and only complete/PMKID handshakes are flushed, which keeps SD writes off the display path.
+- **microSD storage** — PCAPs written to `/sdcard/handshakes/`; the card is mounted at 10 MHz because the LCD and SD share one SPI bus. Web/SET show free space and a **Remount SD** action; writes are atomic (temp + rename), timestamped (`SSID_20261023-160000_BSSID.pcap`), and paired with a `<pcap>.json` sidecar (SSID, BSSID, STA, channel, RSSI, frames, completion/PMKID flags, save time). A dedicated writer task drains a PSRAM queue, so the sniffer never blocks on SD I/O and writes are serialized against display flushes.
 - **Richer PCAPs** — each saved handshake now includes a beacon/probe-response context frame and radiotap channel/RSSI, so aircrack/hcxtools can identify the ESSID and band without manual hints.
 - **On-device learning** — a compact REINFORCE MLP (8→16→6) chooses between six hop plans; weights persist in NVS.
 - **Touch UI** — animated face, moods, XP/level/bond, live stats, event log, network scanner, capture list, and settings. Bottom navigation: **FACE / SCAN / LOOT / SET**.
@@ -97,6 +97,7 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 | GET | `/api/clients` | Observed client table (unicast only) |
 | GET | `/api/hs` | Captured handshakes / PMKIDs plus saved PCAP files |
 | GET | `/api/pcap?name=<file>` | Download a PCAP from `/sdcard/handshakes/` |
+| GET | `/api/hs_meta?name=<file>` | Download the JSON sidecar for a saved PCAP |
 | POST | `/api/scan` | Start a network scan |
 | POST | `/api/connect` | Connect to an AP (`ssid`, `pass`, `save`) |
 | POST | `/api/disconnect` | Disconnect (`forget` optional) |
@@ -205,7 +206,7 @@ docs/                   # Hardware, architecture, legal notes
 ## Troubleshooting
 
 - **Touch is offset or only part of the screen works** — check the boot log line `Touch ready: raw ... swap=... mirror_x=... mirror_y=...`. On this panel it must be `320x480 swap=0 mirror_x=0 mirror_y=0`. If not, fix `touch_flags` in the BSP and rebuild. `touchtest` prints transformed coordinates; tapping the FACE button should print roughly `x=44 y=453`.
-- **`sd: false` or mount failures** — use a FAT32 card, reseat it, and check the boot log. The firmware tries 10 MHz; very slow or counterfeit cards may still fail. Use **Remount SD** in the web **SET** tab; the dashboard now shows free/total space. Only complete/PMKID handshakes are written; partial M1+M2 stays in RAM until a complete handshake or reboot.
+- **`sd: false` or mount failures** — use a FAT32 card, reseat it, and check the boot log. The firmware tries 10 MHz; very slow or counterfeit cards may still fail. Use **Remount SD** in the web **SET** tab; the dashboard now shows free/total space. Complete/PMKID handshakes are queued immediately; partial M1+M2 stays in RAM until a complete handshake, slot eviction, or an explicit `save`/reboot flush.
 - **Handshake counts reset after reboot** — the live slot table is in RAM. Saved PCAPs remain on the card and are listed under **Caps → Saved PCAPs** in the web UI (and can still be downloaded by filename).
 - **Web page unreachable** — confirm the device is associated and use the exact IP from the boot log or `SET` screen. The dashboard is on port 80 and there is no mDNS. Client isolation on some hotspots blocks device-to-device traffic.
 - **Wi-Fi will not connect** — verify the password and security mode. The device scans 2.4 GHz and 5 GHz; the station connects on the AP's channel. Watch the serial log for the disconnect reason.

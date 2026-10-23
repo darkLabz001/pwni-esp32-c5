@@ -12,8 +12,11 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "bsp/esp-bsp.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
@@ -22,8 +25,21 @@
 
 static const char *TAG = "capture";
 
+/* PCAP/sidecar writes run in their own task. capture_add_eapol() only copies
+ * a slot into PSRAM and queues the pointer, so the sniffer never waits on the
+ * SD card. The writer takes the display lock (shared SPI bus) before touching
+ * FATFS. */
+#define PWN_WRITER_QUEUE 8
+#define PWN_WRITER_STACK 8192
+#define PWN_WRITER_PRIO  2
+
 static pwn_handshake_t *s_slots;
 static SemaphoreHandle_t s_lock;
+static QueueHandle_t s_queue;
+static TaskHandle_t s_writer_task;
+static volatile bool s_writer_busy;
+static volatile uint32_t s_dropped;
+static uint32_t s_boot_seq;
 static bool s_sd_ready;
 static bool s_sd_mounted;
 static bool s_sd_writable;
@@ -104,30 +120,189 @@ static void sanitize(char *dst, size_t dstlen, const char *src)
     dst[j] = 0;
 }
 
-static void slot_save(pwn_handshake_t *h)
-{
-    if (!s_sd_ready) {
-        return;
-    }
-    if (h->nframes == 0 || (h->msg_mask == 0 && !h->has_pmkid)) {
-        return;
-    }
+/* ---- filename / metadata --------------------------------------------- */
 
-    if (s_sd_info_valid && s_sd_free > 0 && s_sd_free < 1024 * 1024) {
-        ESP_LOGW(TAG, "SD almost full (%llu bytes free); not saving %s",
-                 (unsigned long long)s_sd_free, h->ssid);
+static void json_escape(char *dst, size_t dstlen, const char *src)
+{
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 7 < dstlen; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c >= 0x20 && c < 0x7f) {
+            dst[j++] = (char)c;
+        } else {
+            j += (size_t)snprintf(dst + j, dstlen - j, "\\u%04x", c);
+        }
+    }
+    dst[j] = 0;
+}
+
+/* SNTP may not have run yet. Without a sane wall clock fall back to a
+ * per-boot sequence so filenames stay unique and sortable-enough. */
+static void file_stamp(char *buf, size_t buflen)
+{
+    time_t now = time(NULL);
+    if (now >= 1577836800) {          /* 2020-01-01T00:00:00Z */
+        struct tm tm;
+        gmtime_r(&now, &tm);
+        strftime(buf, buflen, "%Y%m%d-%H%M%S", &tm);
+    } else {
+        snprintf(buf, buflen, "boot%05u", (unsigned)++s_boot_seq);
+    }
+}
+
+static bool time_is_valid(void)
+{
+    return time(NULL) >= 1577836800;
+}
+
+/* Build the PCAP basename. The BSSID always occupies the last 12 hex chars
+ * before ".pcap" so host tools can parse it; the timestamp (or boot
+ * sequence) sits in the middle. An existing name is reused for updates so a
+ * growing handshake overwrites its own file instead of spawning copies. */
+static void build_name(const pwn_handshake_t *h, const char *existing,
+                       char *name, size_t namelen)
+{
+    char bssid_hex[13];
+    snprintf(bssid_hex, sizeof(bssid_hex), "%02x%02x%02x%02x%02x%02x",
+             h->bssid[0], h->bssid[1], h->bssid[2],
+             h->bssid[3], h->bssid[4], h->bssid[5]);
+
+    if (existing && existing[0]) {
+        snprintf(name, namelen, "%s", existing);
         return;
     }
 
     char ssid[33];
     sanitize(ssid, sizeof(ssid), h->ssid);
+    char stamp[24];
+    file_stamp(stamp, sizeof(stamp));
+    char base[64];
+    snprintf(base, sizeof(base), "%s_%s", ssid, stamp);
 
-    char name[64];
-    snprintf(name, sizeof(name), "%s_%02x%02x%02x%02x%02x%02x.pcap",
-             ssid, h->bssid[0], h->bssid[1], h->bssid[2],
+    /* Two STAs on the same AP can complete in the same second. Keep the
+     * BSSID suffix intact and disambiguate inside the timestamp field. */
+    for (int seq = 0; seq < 100; seq++) {
+        if (seq == 0) {
+            snprintf(name, namelen, "%s_%s.pcap", base, bssid_hex);
+        } else {
+            snprintf(name, namelen, "%s-%02d_%s.pcap", base, seq, bssid_hex);
+        }
+        char path[160];
+        snprintf(path, sizeof(path), PWN_HS_DIR "/%s", name);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            return;                   /* free name */
+        }
+    }
+}
+
+static bool write_sidecar(const pwn_handshake_t *h, const char *name,
+                          const char *path)
+{
+    char ssid_esc[224];
+    json_escape(ssid_esc, sizeof(ssid_esc), h->ssid);
+    char bssid[18], sta[18];
+    snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x",
+             h->bssid[0], h->bssid[1], h->bssid[2],
              h->bssid[3], h->bssid[4], h->bssid[5]);
-    char path[128];
-    char tmp[128];
+    snprintf(sta, sizeof(sta), "%02x:%02x:%02x:%02x:%02x:%02x",
+             h->sta[0], h->sta[1], h->sta[2],
+             h->sta[3], h->sta[4], h->sta[5]);
+
+    char pmkid_json[64] = "";
+    if (h->has_pmkid) {
+        char hex[33];
+        for (int k = 0; k < 16; k++) {
+            snprintf(hex + k * 2, 3, "%02x", h->pmkid[k]);
+        }
+        snprintf(pmkid_json, sizeof(pmkid_json), ",\"pmkid_hex\":\"%s\"", hex);
+    }
+
+    char saved_iso[24] = "";
+    time_t now = time(NULL);
+    if (now >= 1577836800) {
+        struct tm tm;
+        gmtime_r(&now, &tm);
+        strftime(saved_iso, sizeof(saved_iso), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    }
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+                     "{\"file\":\"%s\",\"ssid\":\"%s\",\"bssid\":\"%s\","
+                     "\"sta\":\"%s\",\"channel\":%u,\"rssi\":%d,"
+                     "\"frames\":%u,\"complete\":%s,\"pmkid\":%s,"
+                     "\"saved\":\"%s\",\"saved_epoch\":%lld,"
+                     "\"saved_uptime_ms\":%llu%s}\n",
+                     name, ssid_esc, bssid, sta,
+                     (unsigned)h->channel, (int)h->rssi,
+                     (unsigned)h->nframes,
+                     h->complete ? "true" : "false",
+                     h->has_pmkid ? "true" : "false",
+                     saved_iso, (long long)(now > 0 && time_is_valid() ? now : 0),
+                     (unsigned long long)(esp_timer_get_time() / 1000),
+                     pmkid_json);
+    if (n <= 0 || n >= (int)sizeof(json)) {
+        return false;
+    }
+
+    char tmp[190];
+    snprintf(tmp, sizeof(tmp), PWN_HS_DIR "/.tmp_%s.json", name);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "cannot open %s (errno %d)", tmp, errno);
+        return false;
+    }
+    size_t want = (size_t)n;
+    size_t got = fwrite(json, 1, want, f);
+    bool bad = (got != want) || ferror(f) != 0;
+    if (fclose(f) != 0) {
+        bad = true;
+    }
+    if (bad) {
+        ESP_LOGW(TAG, "sidecar write failed for %s (errno %d)", name, errno);
+        remove(tmp);
+        return false;
+    }
+
+    char meta[180];
+    snprintf(meta, sizeof(meta), "%s.json", path);
+    remove(meta);
+    if (rename(tmp, meta) != 0) {
+        ESP_LOGW(TAG, "sidecar rename failed for %s (errno %d)", name, errno);
+        remove(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* Write PCAP + JSON sidecar as a unit. Caller must hold the display bus
+ * lock. Returns the basename in out on success. */
+static bool pcap_store(const pwn_handshake_t *h, const char *existing,
+                       char *out, size_t outlen)
+{
+    if (!s_sd_ready) {
+        return false;
+    }
+    if (h->nframes == 0 || (h->msg_mask == 0 && !h->has_pmkid)) {
+        return false;
+    }
+    if (s_sd_info_valid && s_sd_free > 0 && s_sd_free < 1024 * 1024) {
+        ESP_LOGW(TAG, "SD almost full (%llu bytes free); not saving %s",
+                 (unsigned long long)s_sd_free, h->ssid);
+        return false;
+    }
+
+    char name[96];
+    build_name(h, existing, name, sizeof(name));
+    if (!name[0]) {
+        return false;
+    }
+
+    char path[160];
+    char tmp[160];
     snprintf(path, sizeof(path), PWN_HS_DIR "/%s", name);
     snprintf(tmp, sizeof(tmp), PWN_HS_DIR "/.tmp_%s", name);
 
@@ -135,7 +310,7 @@ static void slot_save(pwn_handshake_t *h)
     if (!f) {
         ESP_LOGW(TAG, "cannot open %s (errno %d)", tmp, errno);
         s_sd_ready = false;
-        return;
+        return false;
     }
     pcap_global_header(f);
     uint64_t beacon_ts = h->nframes ? h->frames[0].ts_us
@@ -151,30 +326,123 @@ static void slot_save(pwn_handshake_t *h)
     if (fclose(f) != 0) {
         bad = true;
     }
-    if (!bad) {
-        /* FATFS rename() does not replace an existing destination. */
-        remove(path);
-        if (rename(tmp, path) != 0) {
-            bad = true;
-        }
-    }
     if (bad) {
-        ESP_LOGW(TAG, "SD write/rename failed for %s (errno %d)", name, errno);
+        ESP_LOGW(TAG, "SD write failed for %s (errno %d)", name, errno);
         remove(tmp);
         s_sd_ready = false;
+        return false;
+    }
+
+    /* FATFS rename() does not replace an existing destination. */
+    remove(path);
+    if (rename(tmp, path) != 0) {
+        ESP_LOGW(TAG, "SD rename failed for %s (errno %d)", name, errno);
+        remove(tmp);
+        s_sd_ready = false;
+        return false;
+    }
+    /* Best effort: a missing sidecar must not discard a good PCAP. */
+    write_sidecar(h, name, path);
+
+    snprintf(out, outlen, "%s", name);
+    return true;
+}
+
+/* Copy a slot into PSRAM and hand it to the writer. Must be called with the
+ * capture lock held. Never blocks on the SD card. force=true also writes a
+ * partial M1+M2 slot (eviction / explicit flush). */
+static void writer_enqueue(const pwn_handshake_t *h, bool force)
+{
+    if (!s_queue || !s_sd_ready || h->nframes == 0) {
+        return;
+    }
+    if (!h->has_pmkid && (force ? h->msg_mask == 0 : h->msg_mask != 0x0F)) {
         return;
     }
 
-    bool first = !h->saved;
-    h->saved = true;
-    h->saved_frames = h->nframes;
-    snprintf(h->file, sizeof(h->file), "%s", name);
-    if (first) {
-        s_saved++;
+    pwn_handshake_t *copy = heap_caps_malloc(sizeof(*copy), MALLOC_CAP_SPIRAM);
+    if (!copy) {
+        copy = malloc(sizeof(*copy));
     }
-    ESP_LOGI(TAG, "%s %s (%d frames, ch %u, rssi %d, bcn %u, mask 0x%x%s)",
-             first ? "saved" : "updated", path, h->nframes, h->channel,
-             h->rssi, h->bcn_len, h->msg_mask, h->has_pmkid ? ", pmkid" : "");
+    if (!copy) {
+        s_dropped++;
+        return;
+    }
+    memcpy(copy, h, sizeof(*copy));
+    if (xQueueSend(s_queue, &copy, 0) != pdTRUE) {
+        free(copy);
+        s_dropped++;
+        ESP_LOGW(TAG, "SD writer queue full; dropped %s snapshot", h->ssid);
+    }
+}
+
+static pwn_handshake_t *slot_lookup(const uint8_t *bssid, const uint8_t *sta)
+{
+    for (int i = 0; i < PWN_MAX_HS; i++) {
+        pwn_handshake_t *h = &s_slots[i];
+        if (h->nframes > 0 && memcmp(h->bssid, bssid, 6) == 0 &&
+            memcmp(h->sta, sta, 6) == 0) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+static void writer_task(void *arg)
+{
+    (void)arg;
+    pwn_handshake_t *snap = NULL;
+    for (;;) {
+        if (xQueueReceive(s_queue, &snap, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        s_writer_busy = true;
+
+        if (s_sd_ready) {
+            /* Serialize with LVGL flushes on the shared SPI bus. A short
+             * timeout keeps a stuck display from wedging the writer. */
+            bool bus = capture_bus_lock(3000);
+            if (bus) {
+                char existing[96] = "";
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                pwn_handshake_t *slot = slot_lookup(snap->bssid, snap->sta);
+                if (slot && slot->file[0]) {
+                    snprintf(existing, sizeof(existing), "%s", slot->file);
+                }
+                xSemaphoreGive(s_lock);
+
+                char name[96] = "";
+                if (pcap_store(snap, existing, name, sizeof(name))) {
+                    xSemaphoreTake(s_lock, portMAX_DELAY);
+                    slot = slot_lookup(snap->bssid, snap->sta);
+                    if (slot) {
+                        bool first = !slot->saved;
+                        slot->saved = true;
+                        if (snap->nframes > slot->saved_frames) {
+                            slot->saved_frames = snap->nframes;
+                        }
+                        snprintf(slot->file, sizeof(slot->file), "%s", name);
+                        if (first) {
+                            s_saved++;
+                        }
+                    }
+                    xSemaphoreGive(s_lock);
+                    ESP_LOGI(TAG, "saved %s (%u frames, ch %u, rssi %d, "
+                             "mask 0x%x%s)", name, (unsigned)snap->nframes,
+                             (unsigned)snap->channel, (int)snap->rssi,
+                             (unsigned)snap->msg_mask,
+                             snap->has_pmkid ? ", pmkid" : "");
+                }
+                capture_bus_unlock();
+            } else {
+                ESP_LOGW(TAG, "display lock timeout; dropping SD write");
+            }
+        }
+
+        free(snap);
+        snap = NULL;
+        s_writer_busy = false;
+    }
 }
 
 static void slot_reset(pwn_handshake_t *h)
@@ -205,7 +473,7 @@ static pwn_handshake_t *slot_for(const uint8_t *bssid, const uint8_t *sta)
     }
     if (oldest) {
         if (!oldest->saved || oldest->nframes > oldest->saved_frames) {
-            slot_save(oldest);
+            writer_enqueue(oldest, true);
         }
         slot_reset(oldest);
     }
@@ -296,6 +564,8 @@ static bool sd_prepare(void)
 void capture_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
+    s_queue = xQueueCreate(PWN_WRITER_QUEUE, sizeof(pwn_handshake_t *));
+    s_boot_seq = esp_random() % 90000;
     s_slots = heap_caps_calloc(PWN_MAX_HS, sizeof(pwn_handshake_t),
                                MALLOC_CAP_SPIRAM);
     if (!s_slots) {
@@ -305,6 +575,9 @@ void capture_init(void)
         ESP_LOGE(TAG, "out of memory for handshake slots");
         return;
     }
+    if (!s_queue) {
+        ESP_LOGE(TAG, "out of memory for SD writer queue");
+    }
 
     mkdir(PWN_SD_MOUNT, 0777);
     if (sd_mount() == ESP_OK) {
@@ -313,8 +586,16 @@ void capture_init(void)
     } else {
         ESP_LOGW(TAG, "no SD card; handshakes kept in RAM only");
     }
-    ESP_LOGI(TAG, "%d handshake slots, %d bytes each",
-             PWN_MAX_HS, (int)sizeof(pwn_handshake_t));
+
+    if (s_queue &&
+        xTaskCreate(writer_task, "pwn_sd", PWN_WRITER_STACK, NULL,
+                    PWN_WRITER_PRIO, &s_writer_task) != pdPASS) {
+        ESP_LOGE(TAG, "cannot start SD writer task");
+        vQueueDelete(s_queue);
+        s_queue = NULL;
+    }
+    ESP_LOGI(TAG, "%d handshake slots, %d bytes each, writer queue %d",
+             PWN_MAX_HS, (int)sizeof(pwn_handshake_t), PWN_WRITER_QUEUE);
 }
 
 void capture_add_eapol(const uint8_t *bssid, const uint8_t *sta,
@@ -331,18 +612,10 @@ void capture_add_eapol(const uint8_t *bssid, const uint8_t *sta,
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint64_t now_us = (uint64_t)esp_timer_get_time();
 
-    /* SD shares the SPI bus with the LCD. Take the display lock before the
-     * capture lock so a save cannot overlap an LCD flush; see pwn_capture.h.
-     * If the display is not up yet there is no flush to contend with. */
-    bool bus = capture_bus_lock(portMAX_DELAY);
-
     xSemaphoreTake(s_lock, portMAX_DELAY);
     pwn_handshake_t *h = slot_for(bssid, sta);
     if (!h) {
         xSemaphoreGive(s_lock);
-        if (bus) {
-            capture_bus_unlock();
-        }
         return;
     }
 
@@ -407,26 +680,23 @@ void capture_add_eapol(const uint8_t *bssid, const uint8_t *sta,
     }
     /* Save once, then refresh the PCAP whenever another EAPOL message
      * lands so complete handshakes contain M2/M4 rather than just M1. */
-    /* Only hit the SD card for a PMKID or a complete handshake.  Partial
-     * M1+M2 slots stay in RAM until a complete handshake/eviction, which
-     * avoids long SPI/SD writes while the display is flushing. */
-    bool save_now = h->has_pmkid || (h->msg_mask == 0x0F);
-    if (save_now && (!h->saved || h->nframes > h->saved_frames)) {
-        slot_save(h);
-    }
+    /* Only queue an SD write for a PMKID or a complete handshake. Partial
+     * M1+M2 slots stay in RAM until a complete handshake/eviction. */
     if (h->msg_mask == 0x0F) {
         h->complete = true;
     }
+    bool save_now = h->has_pmkid || h->complete;
+    if (save_now && (!h->saved || h->nframes > h->saved_frames)) {
+        writer_enqueue(h, false);
+    }
 
     xSemaphoreGive(s_lock);
-    if (bus) {
-        capture_bus_unlock();
-    }
 }
 
 uint32_t capture_handshake_count(void) { return s_hs_count; }
 uint32_t capture_pmkid_count(void)     { return s_pmkid_count; }
 uint32_t capture_saved_count(void)     { return s_saved; }
+uint32_t capture_dropped_count(void)   { return s_dropped; }
 bool     capture_sd_ready(void)        { return s_sd_ready; }
 
 bool capture_sd_info(pwn_sd_info_t *out)
@@ -529,6 +799,9 @@ int capture_sd_prune(int keep)
             if (unlink(path) == 0) {
                 deleted++;
                 ESP_LOGW(TAG, "pruned %s", ents[i].name);
+                char meta[160];
+                snprintf(meta, sizeof(meta), "%s.json", path);
+                unlink(meta);
             }
         }
     }
@@ -598,21 +871,47 @@ int capture_list_files(pwn_pcap_file_t *out, int max)
     return n;
 }
 
+bool capture_file_for(const uint8_t *bssid, const uint8_t *sta,
+                      char *out, size_t outlen)
+{
+    if (!s_slots || !s_lock || !out || outlen == 0) {
+        return false;
+    }
+    bool found = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pwn_handshake_t *h = slot_lookup(bssid, sta);
+    if (h && h->file[0]) {
+        snprintf(out, outlen, "%s", h->file);
+        found = true;
+    }
+    xSemaphoreGive(s_lock);
+    return found;
+}
+
 void capture_flush_all(void)
 {
-    if (!s_slots || !s_lock) {
+    if (!s_slots || !s_lock || !s_queue) {
         return;
     }
-    bool bus = capture_bus_lock(portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < PWN_MAX_HS; i++) {
         if (s_slots[i].nframes > 0 &&
             (!s_slots[i].saved || s_slots[i].nframes > s_slots[i].saved_frames)) {
-            slot_save(&s_slots[i]);
+            writer_enqueue(&s_slots[i], true);
         }
     }
     xSemaphoreGive(s_lock);
-    if (bus) {
-        capture_bus_unlock();
+
+    /* Wait for the writer to drain so callers (reboot, selftest) can rely on
+     * the files being on the card. Require two consecutive idle polls: the
+     * writer clears s_writer_busy just after taking the last queue item. */
+    int idle = 0;
+    for (int i = 0; i < 750 && idle < 2; i++) {
+        if (!s_writer_busy && uxQueueMessagesWaiting(s_queue) == 0) {
+            idle++;
+        } else {
+            idle = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

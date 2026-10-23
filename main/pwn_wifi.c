@@ -1225,9 +1225,13 @@ int pwn_wifi_selftest(void)
         return hs > 0 ? 0 : -1;
     }
 
-    char path[128];
-    snprintf(path, sizeof(path), PWN_HS_DIR "/%s_%02x%02x%02x%02x%02x%02x.pcap",
-             ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    char name[96];
+    char path[160];
+    if (!capture_file_for(bssid, sta, name, sizeof(name))) {
+        ESP_LOGE(TAG, "selftest: slot has no saved PCAP");
+        return -2;
+    }
+    snprintf(path, sizeof(path), PWN_HS_DIR "/%s", name);
     if (!capture_bus_lock(portMAX_DELAY)) {
         ESP_LOGE(TAG, "selftest: display lock unavailable");
         return -5;

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "pwn_config.h"
 
 #ifndef PWN_BCN_MAX
@@ -30,7 +31,7 @@ typedef struct {
     uint8_t pmkid[16];
     uint32_t first_seen_ms;
     uint32_t last_seen_ms;
-    char    file[64];         /* basename of the saved PCAP (empty if none) */
+    char    file[96];         /* basename of the saved PCAP (empty if none) */
     struct {
         uint64_t ts_us;
         uint16_t len;
@@ -51,6 +52,8 @@ void capture_add_eapol(const uint8_t *bssid, const uint8_t *sta,
 uint32_t capture_handshake_count(void);
 uint32_t capture_pmkid_count(void);
 uint32_t capture_saved_count(void);
+/* Snapshots dropped because the SD writer queue was full. */
+uint32_t capture_dropped_count(void);
 bool     capture_sd_ready(void);
 
 typedef struct {
@@ -82,7 +85,13 @@ int capture_list_files(pwn_pcap_file_t *out, int max);
 /* Copy the slot table for the CLI / UI. Returns number written. */
 int capture_snapshot(pwn_handshake_t *out, int max);
 
-/* Write any pending slots out (called before reboot / on demand). */
+/* Basename of the last PCAP saved for (bssid, sta). Returns false if the
+ * slot is unknown or has not been written to the card yet. */
+bool capture_file_for(const uint8_t *bssid, const uint8_t *sta,
+                      char *out, size_t outlen);
+
+/* Write any pending slots out (called before reboot / on demand). This
+ * enqueues the remaining slots and waits for the writer task to drain. */
 void capture_flush_all(void);
 
 /* The SD card and the LCD share one SPI bus. Any code touching the
@@ -91,6 +100,7 @@ void capture_flush_all(void);
  * the flush and would otherwise trip the task watchdog).
  *
  * Lock order is always display -> capture. Never take the capture lock
- * (capture_snapshot/add_eapol/flush_all) before this one. */
+ * (capture_snapshot/file_for) before this one. capture_add_eapol only queues
+ * a PSRAM copy, so the sniffer never waits on the SD card. */
 bool capture_bus_lock(uint32_t timeout_ms);
 void capture_bus_unlock(void);

@@ -212,6 +212,7 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(r, "hs_count", st->hs_count);
     cJSON_AddNumberToObject(r, "pmkid_count", st->pmkid_count);
     cJSON_AddNumberToObject(r, "saved_count", st->saved_count);
+    cJSON_AddNumberToObject(r, "hs_writer_dropped", capture_dropped_count());
     cJSON_AddNumberToObject(r, "frames", st->frames);
     cJSON_AddNumberToObject(r, "eapol", st->eapol);
     cJSON_AddNumberToObject(r, "deauths", st->deauths);
@@ -371,6 +372,8 @@ static esp_err_t hs_get(httpd_req_t *req)
         cJSON_AddStringToObject(o, "ssid", hs[i].ssid);
         cJSON_AddStringToObject(o, "bssid", bssid);
         cJSON_AddStringToObject(o, "sta", sta);
+        cJSON_AddNumberToObject(o, "channel", hs[i].channel);
+        cJSON_AddNumberToObject(o, "rssi", hs[i].rssi);
         cJSON_AddNumberToObject(o, "mask", hs[i].msg_mask);
         cJSON_AddNumberToObject(o, "frames", hs[i].nframes);
         cJSON_AddBoolToObject(o, "complete", hs[i].complete);
@@ -390,8 +393,9 @@ static esp_err_t hs_get(httpd_req_t *req)
 
     /* The live slot table is RAM-only.  List the PCAPs that survived on the
      * SD card so the dashboard still shows them after a reboot. */
-    pwn_pcap_file_t files[24];
-    int nf = capture_list_files(files, 24);
+    enum { HS_FILE_MAX = 128 };
+    pwn_pcap_file_t *files = big_calloc(HS_FILE_MAX, sizeof(*files));
+    int nf = files ? capture_list_files(files, HS_FILE_MAX) : 0;
     cJSON *fa = cJSON_AddArrayToObject(root, "files");
     for (int i = 0; i < nf; i++) {
         cJSON *o = cJSON_CreateObject();
@@ -399,6 +403,7 @@ static esp_err_t hs_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "size", files[i].size);
         cJSON_AddItemToArray(fa, o);
     }
+    free(files);
     return send_json(req, root);
 }
 
@@ -1050,6 +1055,9 @@ static esp_err_t pcap_delete_post(httpd_req_t *req)
     char path[160];
     snprintf(path, sizeof(path), PWN_HS_DIR "/%s", name);
     int rc = unlink(path);
+    char meta[176];
+    snprintf(meta, sizeof(meta), "%s.json", path);
+    unlink(meta);
     cJSON_Delete(body);
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "ok", rc == 0);
@@ -1058,6 +1066,73 @@ static esp_err_t pcap_delete_post(httpd_req_t *req)
         httpd_resp_set_status(req, "404 Not Found");
     }
     return send_json(req, r);
+}
+
+/* Serve the JSON sidecar for a saved PCAP. Accepts either the PCAP basename
+ * or the ".json" name. */
+static esp_err_t hs_meta_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char q[128];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) {
+        return fail(req, "400 Bad Request", "missing file");
+    }
+    char name[96];
+    if (httpd_query_key_value(q, "name", name, sizeof(name)) != ESP_OK ||
+        !safe_name(name)) {
+        return fail(req, "400 Bad Request", "invalid file name");
+    }
+    size_t len = strlen(name);
+    if (len > 5 && strcasecmp(name + len - 5, ".json") == 0) {
+        name[len - 5] = 0;
+        len -= 5;
+    }
+    if (len == 0) {
+        return fail(req, "400 Bad Request", "invalid file name");
+    }
+
+    char path[160];
+    snprintf(path, sizeof(path), PWN_HS_DIR "/%s.json", name);
+
+    if (!capture_bus_lock(portMAX_DELAY)) {
+        return fail(req, "503 Service Unavailable", "display busy");
+    }
+    struct stat stt;
+    if (stat(path, &stt) != 0 || !S_ISREG(stt.st_mode) ||
+        stt.st_size <= 0 || stt.st_size > 8192) {
+        capture_bus_unlock();
+        return fail(req, "404 Not Found", "no such sidecar");
+    }
+    char *buf = malloc((size_t)stt.st_size + 1);
+    if (!buf) {
+        capture_bus_unlock();
+        return fail(req, "500 Internal Server Error", "out of memory");
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        free(buf);
+        capture_bus_unlock();
+        return fail(req, "500 Internal Server Error", "open failed");
+    }
+    size_t got = fread(buf, 1, (size_t)stt.st_size, f);
+    fclose(f);
+    capture_bus_unlock();
+    if (got != (size_t)stt.st_size) {
+        free(buf);
+        return fail(req, "500 Internal Server Error", "read failed");
+    }
+    buf[got] = 0;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char disp[128];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s.json\"", name);
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    esp_err_t err = httpd_resp_send(req, buf, got);
+    free(buf);
+    return err;
 }
 
 static esp_err_t pcap_get(httpd_req_t *req)
@@ -1317,6 +1392,7 @@ esp_err_t web_start(void)
         {.uri = "/api/hs",           .method = HTTP_GET,  .handler = hs_get},
         {.uri = "/api/sd",           .method = HTTP_POST, .handler = sd_post},
         {.uri = "/api/pcap",         .method = HTTP_GET,  .handler = pcap_get},
+        {.uri = "/api/hs_meta",      .method = HTTP_GET,  .handler = hs_meta_get},
         {.uri = "/api/pcap_delete",  .method = HTTP_POST, .handler = pcap_delete_post},
         {.uri = "/api/scan",         .method = HTTP_POST, .handler = scan_post},
         {.uri = "/api/connect",      .method = HTTP_POST, .handler = connect_post},

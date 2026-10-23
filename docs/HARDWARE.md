@@ -84,8 +84,8 @@ If a different panel revision is rotated, change the flags and the `x_max`/`y_ma
   - allocation unit 16 KB
   - no format-on-failure
 - The mount probes a write and close. If the card is missing, read-only, or failing, `s_sd_ready` stays false, the UI reports `sd: false`, and captures remain in RAM. The web **SET** page shows free/total space and has a **Remount SD** button.
-- PCAPs are written atomically (temp + rename); writes are limited to PMKID/complete handshakes. Large slot/AP tables live in PSRAM so the CLI and HTTP tasks keep internal RAM.
-- `capture_bus_lock()` / `capture_bus_unlock()` serialize SD I/O against LVGL flush operations. The web PCAP download and capture writes use the same lock.
+- PCAPs are written atomically (temp + rename) with a JSON sidecar; a dedicated PSRAM queue/writer task keeps SD writes off the sniffer path. Large slot/AP tables live in PSRAM so the CLI and HTTP tasks keep internal RAM.
+- `capture_bus_lock()` / `capture_bus_unlock()` serialize SD I/O against LVGL flush operations. The web PCAP/sidecar download and the capture writer task use the same lock.
 
 ## Clocks and power
 

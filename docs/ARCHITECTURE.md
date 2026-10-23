@@ -57,9 +57,10 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 ### `pwn_capture` — handshakes and PCAP
 
 - Slot table keyed by `(BSSID, STA)`, up to `PWN_HS_FRAMES` frames per slot. Slots live in PSRAM so internal RAM stays available for task stacks.
-- A handshake is counted when a PMKID is present, M1+M2 are seen, or all four messages are seen. The SD write happens only for a PMKID or a complete handshake; partial M1+M2 stays in RAM until a complete handshake or eviction.
+- A handshake is counted when a PMKID is present, M1+M2 are seen, or all four messages are seen. PMKID/complete slots are queued immediately; partial M1+M2 stays in RAM until a complete handshake, eviction, or an explicit flush.
+- `capture_add_eapol()` never touches the SD card. It copies the slot into PSRAM and posts it to a queue drained by the `pwn_sd` writer task, which takes `capture_bus_lock()` and freezes the snapshot while it writes.
 - Each slot carries a beacon/probe-response context frame plus channel/RSSI. PCAP format: little-endian global header, microsecond timestamps, link type 127, a 24-byte radiotap header with channel/frequency/dBm, then the context and 802.11 frames.
-- Files are written atomically to `/sdcard/handshakes/` (temp file + rename), with a free-space guard. `capture_sd_info()` reports total/free; `capture_sd_remount()` re-mounts after a card/write failure; `capture_sd_prune()` enforces a file-count limit.
+- Files are named `SSID_YYYYmmdd-HHMMSS_BSSID.pcap` (or `SSID_bootNNNNN_BSSID.pcap` before SNTP sync) and written atomically to `/sdcard/handshakes/` (temp file + rename), with a free-space guard. A `<pcap>.json` sidecar carries the SSID, BSSID, STA, channel, RSSI, frame count, completion/PMKID flags and save time. `capture_sd_info()` reports total/free; `capture_sd_remount()` re-mounts after a card/write failure; `capture_sd_prune()` enforces a file-count limit and removes sidecars with their PCAP.
 - The live slot table is RAM-only and resets on reboot. `capture_list_files()` scans the directory for the web **Caps → Saved PCAPs** table, so files on the card remain visible and downloadable across reboots.
 - The SD card is mounted at 10 MHz on SPI2. `capture_bus_lock()` / `capture_bus_unlock()` serialize SD I/O with LVGL panel flushes. Large snapshot arrays use PSRAM to keep internal RAM for the CLI/HTTP/LVGL tasks.
 

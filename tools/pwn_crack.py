@@ -9,6 +9,7 @@ Examples:
     python3 tools/pwn_crack.py --watch
     python3 tools/pwn_crack.py --ip <device-ip>
     python3 tools/pwn_crack.py --list
+    python3 tools/pwn_crack.py --download-all <device-ip> <dest-dir>
     python3 tools/pwn_crack.py --crack /tmp/hs.pcap --bssid AA:BB:CC:DD:EE:FF \
         --wordlist /tmp/words.txt
     python3 tools/pwn_crack.py --pmkid <32-hex> --bssid AA:BB:CC:DD:EE:FF \
@@ -203,20 +204,49 @@ def fetch_device(ip: str) -> tuple[dict, dict]:
     return api_json(ip, "/api/status"), api_json(ip, "/api/hs")
 
 
+def _device_get(ip: str, path: str, timeout: float = 15.0) -> bytes:
+    url = f"http://{ip}{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0", "Authorization": AUTH_HEADER})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
 def download_pcap(ip: str, name: str) -> Path:
     CACHE.mkdir(parents=True, exist_ok=True)
     safe = Path(name).name
     dest = CACHE / safe
-    url = f"http://{ip}/api/pcap?name={urllib.parse.quote(name, safe='')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0", "Authorization": AUTH_HEADER})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        data = r.read()
+    data = _device_get(ip, f"/api/pcap?name={urllib.parse.quote(name, safe='')}")
     if not data:
         raise RuntimeError("empty PCAP response")
     if data[:1] == b"<":
         raise RuntimeError("server returned HTML instead of a PCAP")
     dest.write_bytes(data)
+    # Fetch the JSON sidecar next to the capture when the firmware has one.
+    try:
+        meta = _device_get(ip, f"/api/hs_meta?name={urllib.parse.quote(name, safe='')}")
+        if meta:
+            (dest.parent / (safe + ".json")).write_bytes(meta)
+    except Exception:
+        pass
     return dest
+
+
+def download_sidecar(ip: str, name: str, dest_dir: Path) -> dict | None:
+    """Download <pcap>.json. Returns parsed metadata, or None if absent."""
+    safe = Path(name).name
+    try:
+        data = _device_get(ip, f"/api/hs_meta?name={urllib.parse.quote(name, safe='')}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    if not data:
+        return None
+    (dest_dir / (safe + ".json")).write_bytes(data)
+    try:
+        return json.loads(data.decode("utf-8", "replace"))
+    except Exception:
+        return None
 
 
 def file_bssid(name: str) -> str:
@@ -227,8 +257,16 @@ def file_bssid(name: str) -> str:
     return ":".join(h[i:i + 2] for i in range(0, 12, 2))
 
 
+# Current names: SSID_20261023-160000_BSSID.pcap (an optional -NN collision
+# tag may follow the timestamp) and the pre-SNTP SSID_boot00042_BSSID.pcap.
+# Legacy names from older firmware are SSID_BSSID.pcap.
+_NEW_NAME_RE = re.compile(
+    r"^(.*)_(?:\d{8}-\d{6}(?:-\d{2})?|boot\d+)_[0-9a-fA-F]{12}\.pcap$")
+_OLD_NAME_RE = re.compile(r"^(.*)_[0-9a-fA-F]{12}\.pcap$")
+
+
 def file_ssid(name: str) -> str:
-    m = re.match(r"(.+)_[0-9a-fA-F]{12}\.pcap$", name)
+    m = _NEW_NAME_RE.match(name) or _OLD_NAME_RE.match(name)
     return m.group(1) if m else ""
 
 
@@ -834,6 +872,59 @@ def cmd_list(ip: str | None, scan: bool) -> int:
     return 0
 
 
+def cmd_download_all(ip: str, dest: str) -> int:
+    """Download every PCAP the device reports as saved, plus its sidecar."""
+    outdir = Path(dest).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        hs = api_json(ip, "/api/hs", 10)
+    except Exception as exc:
+        print(f"ERROR: cannot read {ip}/api/hs: {exc}", file=sys.stderr)
+        return 2
+
+    files = sorted(hs.get("files", []), key=lambda f: f.get("name", ""))
+    if not files:
+        print(f"no saved PCAPs on {ip} (live slots: {len(hs.get('hs', []))})")
+        return 1
+
+    pcaps = 0
+    metas = 0
+    failed = 0
+    for entry in files:
+        name = entry.get("name", "")
+        if not name:
+            continue
+        safe = Path(name).name
+        try:
+            data = _device_get(ip, f"/api/pcap?name={urllib.parse.quote(name, safe='')}")
+            if not data or data[:1] == b"<":
+                raise RuntimeError("not a PCAP")
+        except Exception as exc:
+            print(f"  FAIL {name}: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+        (outdir / safe).write_bytes(data)
+        pcaps += 1
+        size = _fmt_size(len(data))
+
+        meta = None
+        try:
+            meta = download_sidecar(ip, name, outdir)
+        except Exception as exc:
+            print(f"  warn {name}: sidecar download failed: {exc}", file=sys.stderr)
+        if meta is not None:
+            metas += 1
+            bssid = meta.get("bssid") or file_bssid(name)
+            ssid = meta.get("ssid") or file_ssid(name)
+            print(f"  ok   {safe}  {size}  {ssid}  {bssid}")
+        else:
+            print(f"  ok   {safe}  {size}  (no sidecar)")
+
+    print(f"\n{pcaps} PCAP(s) and {metas} sidecar(s) saved to {outdir}"
+          + (f", {failed} failed" if failed else ""))
+    return 0 if failed == 0 else 1
+
+
 def cmd_crack(pcap: str, bssid: str, essid: str, wordlist: str) -> int:
     found, key, output = aircrack(Path(pcap), bssid, Path(wordlist), essid,
                                   on_line=lambda line: print(line, flush=True))
@@ -923,6 +1014,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-watch", action="store_true", help="show the GUI immediately")
     ap.add_argument("--no-scan", action="store_true", help="do not scan the LAN")
     ap.add_argument("--list", action="store_true", help="print device handshakes and exit")
+    ap.add_argument("--download-all", nargs=2, metavar=("DEVICE_IP", "DEST_DIR"),
+                    help="download every saved PCAP and JSON sidecar, then exit")
     ap.add_argument("--wordlists", action="store_true", help="print discovered wordlists and exit")
     ap.add_argument("--crack", metavar="PCAP", help="crack a local PCAP and exit")
     ap.add_argument("--crack-dir", metavar="DIR", help="crack every PCAP in a directory and exit")
@@ -939,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         return cmd_list(args.ip, not args.no_scan)
+    if args.download_all:
+        return cmd_download_all(args.download_all[0], args.download_all[1])
     if args.wordlists:
         for p in find_wordlists():
             print(p)

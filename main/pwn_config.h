@@ -10,7 +10,7 @@
  * permission to test.
  * ---------------------------------------------------------------------- */
 
-#define PWN_VERSION "0.2.0"
+#define PWN_VERSION "0.2.9"
 
 /* Passive/active policy. Active deauthentication is still gated behind a
  * runtime authorization phrase, but is compiled in so the web UI and CLI can

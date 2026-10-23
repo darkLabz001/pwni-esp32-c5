@@ -39,8 +39,12 @@ It downloads `rockyou.txt` (about 134 MB) and the SecLists top-1M list into
 
 The device stores only EAPOL frames, not beacons, so the tool passes both the
 BSSID and ESSID to aircrack-ng. Saved files are named
-`SSID_<12-hex-BSSID>.pcap`, which lets the tool recover both from files that
-are not in the live handshake table.
+`SSID_20261023-160000_<12-hex-BSSID>.pcap` (or
+`SSID_boot00042_<12-hex-BSSID>.pcap` before SNTP has synced). The BSSID is
+always the last 12 hex characters, which lets the tool recover both from
+files that are not in the live handshake table. Each PCAP has a JSON sidecar
+(`<pcap>.json`) with the SSID, BSSID, station, channel, RSSI, frame count,
+completion/PMKID flags and save time.
 
 ## Crack a PMKID
 
@@ -100,6 +104,9 @@ Closing the window exits that watcher; it will start again at next login.
 ```sh
 # list device + handshakes + SD files
 python3 tools/crack.py --list
+
+# download every saved PCAP and sidecar from the device
+python3 tools/crack.py --download-all <device-ip> ~/pwni-captures
 
 # see the wordlist search order
 python3 tools/crack.py --wordlists
