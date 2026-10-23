@@ -247,7 +247,7 @@ Prebuilt firmware and the host tool are published at:
 
 - Download `esp32touch.bin`, `bootloader.bin`, `partition-table.bin`,
   `ota_data_initial.bin`, and `flash.sh`, then run `./flash.sh [port]`.
-- Update a reachable device manually from **Settings → Maintenance → Update from GitHub**. The device downloads `dist/esp32touch.bin` from this repo; nothing is automatic.
+- Update a reachable device manually from **Settings → Maintenance → Update from GitHub**. The device fetches the tag-pinned `dist/ota.json`, downloads the image to SD, verifies its SHA-256, and only then writes the inactive OTA slot and reboots. A missing SD card, bad manifest, or hash mismatch aborts without touching the running firmware. Nothing is automatic.
 - The release tool zip contains the PCAP cracker and C5 deauth patch helper;
   wordlists are fetched by `tools/get_wordlists.sh`, not bundled.
 

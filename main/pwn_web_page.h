@@ -300,10 +300,12 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
       <button class="act danger" id="bOta">Upload firmware &amp; reboot</button>
       <button class="act" id="bOtaGh">Update from GitHub</button>
     </div>
+    <div id="otaState" class="hint">OTA idle</div>
     <div class="hint">Firmware update is manual and gated by the authorization
-    phrase. <b>Update from GitHub</b> makes the device download the latest
-    <code>dist/esp32touch.bin</code> from the public repo and reboot. Nothing is
-    checked automatically.</div>
+    phrase. <b>Update from GitHub</b> fetches the tag-pinned
+    <code>dist/ota.json</code>, downloads the image to SD, verifies its SHA-256,
+    and only then flashes the inactive slot and reboots. Nothing is checked
+    automatically.</div>
   </div>
   <div class="panel">
     <h2>System</h2>
@@ -401,6 +403,16 @@ function renderStatus(){
     'sd card    '+(S.sd?'ready':'not mounted')+'  '+
       (S.sd_free?fmtB(S.sd_free)+' free / '+fmtB(S.sd_total):'')+'\n'+
     'uptime     '+fmtUp(S.uptime);}
+  if($('#otaState')){
+    const ost=S.ota_state||'idle';
+    const obusy=(ost==='downloading'||ost==='verifying'||ost==='flashing');
+    let oh='<span class="tag '+(ost==='error'?'bad':(obusy?'warn':'good'))+'">'+esc(ost)+'</span>';
+    if(obusy)oh+=' <span class="mono">'+Math.round(S.ota_progress||0)+'%</span>';
+    if(ost==='error'&&S.ota_error)oh+=' <span style="color:var(--bad)">'+esc(S.ota_error)+'</span>';
+    $('#otaState').innerHTML=oh;
+    if($('#bOtaGh'))$('#bOtaGh').disabled=obusy;
+    if($('#bOta'))$('#bOta').disabled=obusy;
+  }
 }
 async function poll(){try{S=await api('/api/status');renderStatus();fillApSelect()}catch(e){}}
 function fillApSelect(){
@@ -561,10 +573,12 @@ $('#bResetBrain').onclick=async()=>{if(!confirm('Reset the learned strategy?'))r
 $('#bReboot').onclick=async()=>{if(!confirm('Reboot the device?'))return;
   toast('rebooting...');try{await post('/api/reboot',{})}catch(e){}};
 $('#bOtaGh').onclick=async()=>{
-  if(!confirm('Download the latest firmware from GitHub and reboot?'))return;
+  if(!confirm('Download the latest firmware from GitHub, verify its SHA-256, and reboot?'))return;
   toast('contacting GitHub...');
-  try{const j=await post('/api/ota_github',{});toast('OTA started; device will reboot');}
-  catch(e){}};
+  try{const j=await post('/api/ota_github',{});
+    if(j.started){toast('OTA started; manifest + SHA-256 will be verified');poll();}
+    else toast('OTA not started',true);
+  }catch(e){}};
 $('#bOta').onclick=async()=>{const f=$('#otaFile').files[0];
   if(!f)return toast('choose a firmware .bin',true);
   if(!confirm('Flash '+f.name+' and reboot?'))return;

@@ -21,7 +21,6 @@ idf_component_register(
         esp_driver_usb_serial_jtag
         esp_http_server
         app_update
-        esp_https_ota
         esp_http_client
         esp-tls
         mbedtls

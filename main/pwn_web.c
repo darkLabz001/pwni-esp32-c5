@@ -4,17 +4,20 @@
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <errno.h>
 #include <ctype.h>
 #include <sys/stat.h>
 
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
-#include "esp_https_ota.h"
 #include "esp_crt_bundle.h"
+#include "mbedtls/sha256.h"
 #include "esp_sntp.h"
 #include <time.h>
 #include "cJSON.h"
@@ -40,6 +43,21 @@ static void *big_calloc(size_t n, size_t size)
     return p ? p : calloc(n, size);
 }
 static httpd_handle_t s_server;
+
+/* Manual GitHub OTA state (reported by /api/status). */
+#define OTA_ERR_MAX 192
+
+typedef enum {
+    OTA_ST_IDLE = 0,
+    OTA_ST_DOWNLOADING,
+    OTA_ST_VERIFYING,
+    OTA_ST_FLASHING,
+    OTA_ST_ERROR,
+} ota_state_t;
+
+static const char *ota_state_name(ota_state_t st);
+static void ota_status_snapshot(ota_state_t *st, int *progress,
+                                char *err, size_t errsz);
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -266,6 +284,13 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddStringToObject(r, "hs_dir", PWN_HS_DIR);
     const esp_partition_t *runpart = esp_ota_get_running_partition();
     cJSON_AddStringToObject(r, "ota_running", runpart ? runpart->label : "?");
+    ota_state_t ota_st;
+    int ota_prog;
+    char ota_err[OTA_ERR_MAX];
+    ota_status_snapshot(&ota_st, &ota_prog, ota_err, sizeof(ota_err));
+    cJSON_AddStringToObject(r, "ota_state", ota_state_name(ota_st));
+    cJSON_AddNumberToObject(r, "ota_progress", ota_prog);
+    cJSON_AddStringToObject(r, "ota_error", ota_err);
 
     cJSON_AddBoolToObject(r, "connected", net.connected);
     cJSON_AddBoolToObject(r, "connecting", net.connecting);
@@ -1361,7 +1386,88 @@ static esp_err_t pcap_get(httpd_req_t *req)
 
 
 
+#define OTA_MANIFEST_MAX  4096
+#define OTA_MIN_IMAGE     (64 * 1024)
+#define OTA_SD_RESERVE    (256 * 1024)
+
+static portMUX_TYPE s_ota_mux = portMUX_INITIALIZER_UNLOCKED;
+static ota_state_t s_ota_state = OTA_ST_IDLE;
+static int s_ota_progress;
+static char s_ota_error[OTA_ERR_MAX];
 static volatile bool s_github_ota_busy;
+
+static const char *ota_state_name(ota_state_t st)
+{
+    switch (st) {
+    case OTA_ST_DOWNLOADING: return "downloading";
+    case OTA_ST_VERIFYING:   return "verifying";
+    case OTA_ST_FLASHING:    return "flashing";
+    case OTA_ST_ERROR:       return "error";
+    default:                 return "idle";
+    }
+}
+
+static void ota_str_copy(char *dst, size_t dstsz, const char *src)
+{
+    if (!dst || dstsz == 0) {
+        return;
+    }
+    if (!src) {
+        src = "";
+    }
+    size_t n = strlen(src);
+    if (n >= dstsz) {
+        n = dstsz - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void ota_state_set(ota_state_t st, const char *err)
+{
+    taskENTER_CRITICAL(&s_ota_mux);
+    s_ota_state = st;
+    if (err && err[0]) {
+        ota_str_copy(s_ota_error, sizeof(s_ota_error), err);
+    } else {
+        s_ota_error[0] = '\0';
+    }
+    taskEXIT_CRITICAL(&s_ota_mux);
+}
+
+static void ota_progress_set(int progress)
+{
+    if (progress < 0) {
+        progress = 0;
+    } else if (progress > 100) {
+        progress = 100;
+    }
+    taskENTER_CRITICAL(&s_ota_mux);
+    s_ota_progress = progress;
+    taskEXIT_CRITICAL(&s_ota_mux);
+}
+
+static void ota_status_snapshot(ota_state_t *st, int *progress,
+                                char *err, size_t errsz)
+{
+    taskENTER_CRITICAL(&s_ota_mux);
+    *st = s_ota_state;
+    *progress = s_ota_progress;
+    ota_str_copy(err, errsz, s_ota_error);
+    taskEXIT_CRITICAL(&s_ota_mux);
+}
+
+static void ota_fail(const char *fmt, ...)
+{
+    char msg[OTA_ERR_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    ESP_LOGE(TAG, "GitHub OTA failed: %s", msg);
+    ota_state_set(OTA_ST_ERROR, msg);
+    s_github_ota_busy = false;
+}
 
 static bool ota_sync_time(void)
 {
@@ -1382,32 +1488,530 @@ static bool ota_sync_time(void)
     return false;
 }
 
+/* ---- verified download ------------------------------------------------ */
+
+typedef enum {
+    OTA_DL_MANIFEST = 0,
+    OTA_DL_IMAGE,
+} ota_dl_kind_t;
+
+typedef struct {
+    ota_dl_kind_t kind;
+    char *mem;
+    size_t mem_len;
+    size_t mem_cap;
+    int64_t total;
+    char location[512];
+    char err[OTA_ERR_MAX];
+} ota_dl_t;
+
+static void ota_dl_error(ota_dl_t *dl, const char *fmt, ...)
+{
+    if (!dl || dl->err[0]) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(dl->err, sizeof(dl->err), fmt, ap);
+    va_end(ap);
+}
+
+static esp_err_t ota_http_event(esp_http_client_event_t *evt)
+{
+    ota_dl_t *dl = (ota_dl_t *)evt->user_data;
+    if (dl && evt->event_id == HTTP_EVENT_ON_HEADER &&
+        evt->header_key && evt->header_value &&
+        strcasecmp(evt->header_key, "Location") == 0) {
+        ota_str_copy(dl->location, sizeof(dl->location), evt->header_value);
+    }
+    return ESP_OK;
+}
+
+static esp_http_client_handle_t ota_http_init(const char *url, ota_dl_t *dl)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 30000,
+        .keep_alive_enable = false,
+        .buffer_size = 4096,
+        .buffer_size_tx = 1024,
+        .event_handler = ota_http_event,
+        .user_data = dl,
+    };
+    return esp_http_client_init(&cfg);
+}
+
+/* Open a GET request and follow redirects manually so the caller controls
+ * streaming and can abort without buffering the image in RAM. */
+static esp_err_t ota_http_open(esp_http_client_handle_t client, ota_dl_t *dl)
+{
+    for (int hop = 0; hop < 5; hop++) {
+        dl->location[0] = '\0';
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            ota_dl_error(dl, "connect failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        int64_t len = esp_http_client_fetch_headers(client);
+        if (len < 0) {
+            ota_dl_error(dl, "header read failed");
+            esp_http_client_close(client);
+            return ESP_FAIL;
+        }
+        dl->total = len;
+        int status = esp_http_client_get_status_code(client);
+        if (status == 200) {
+            return ESP_OK;
+        }
+        if ((status == 301 || status == 302 || status == 303 ||
+             status == 307 || status == 308) && dl->location[0]) {
+            ESP_LOGW(TAG, "GitHub OTA: HTTP %d redirect -> %s",
+                     status, dl->location);
+            esp_http_client_close(client);
+            if (esp_http_client_set_url(client, dl->location) != ESP_OK) {
+                ota_dl_error(dl, "invalid redirect URL");
+                return ESP_FAIL;
+            }
+            continue;
+        }
+        ota_dl_error(dl, "HTTP status %d", status);
+        esp_http_client_close(client);
+        return ESP_FAIL;
+    }
+    ota_dl_error(dl, "too many redirects");
+    return ESP_FAIL;
+}
+
+static bool ota_valid_sha256(const char *s)
+{
+    if (!s || strlen(s) != 64) {
+        return false;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (!isxdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ota_valid_filename(const char *s)
+{
+    if (!s) {
+        return false;
+    }
+    size_t len = strlen(s);
+    if (len < 5 || len > 63 || strstr(s, "..")) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    const char *dot = strrchr(s, '.');
+    return dot && strcasecmp(dot, ".bin") == 0;
+}
+
+static void ota_hex_encode(const uint8_t *in, size_t len, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = hex[in[i] >> 4];
+        out[i * 2 + 1] = hex[in[i] & 0x0f];
+    }
+    out[len * 2] = '\0';
+}
+
+static esp_err_t ota_fetch_manifest(char *sha_out, size_t sha_sz,
+                                    char *file_out, size_t file_sz,
+                                    char *err, size_t errsz)
+{
+    ota_dl_t dl = {0};
+    dl.kind = OTA_DL_MANIFEST;
+    dl.mem_cap = OTA_MANIFEST_MAX;
+    dl.mem = calloc(1, dl.mem_cap + 1);
+    if (!dl.mem) {
+        ota_str_copy(err, errsz, "out of memory for manifest");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_handle_t client = ota_http_init(PWN_OTA_MANIFEST_URL, &dl);
+    if (!client) {
+        free(dl.mem);
+        ota_str_copy(err, errsz, "cannot create HTTP client");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t rc = ota_http_open(client, &dl);
+    if (rc == ESP_OK && dl.total > (int64_t)dl.mem_cap) {
+        ota_dl_error(&dl, "manifest too large");
+        rc = ESP_FAIL;
+    }
+    while (rc == ESP_OK) {
+        size_t space = dl.mem_cap - dl.mem_len;
+        if (space == 0) {
+            char extra;
+            int n = esp_http_client_read(client, &extra, 1);
+            if (n != 0) {
+                ota_dl_error(&dl, "manifest too large");
+                rc = ESP_FAIL;
+            }
+            break;
+        }
+        int n = esp_http_client_read(client, dl.mem + dl.mem_len, (int)space);
+        if (n < 0) {
+            ota_dl_error(&dl, "manifest read failed");
+            rc = ESP_FAIL;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        dl.mem_len += n;
+    }
+    if (rc == ESP_OK && dl.total > 0 && dl.mem_len != (size_t)dl.total) {
+        ota_dl_error(&dl, "manifest truncated");
+        rc = ESP_FAIL;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (rc == ESP_OK) {
+        dl.mem[dl.mem_len] = '\0';
+        cJSON *root = cJSON_Parse((const char *)dl.mem);
+        if (!root) {
+            ota_dl_error(&dl, "manifest JSON parse failed");
+            rc = ESP_FAIL;
+        } else {
+            const char *sha = cJSON_GetStringValue(
+                cJSON_GetObjectItemCaseSensitive(root, "sha256"));
+            const char *file = cJSON_GetStringValue(
+                cJSON_GetObjectItemCaseSensitive(root, "file"));
+            if (!ota_valid_sha256(sha)) {
+                ota_dl_error(&dl, "manifest sha256 is missing or invalid");
+                rc = ESP_FAIL;
+            } else if (!ota_valid_filename(file)) {
+                ota_dl_error(&dl, "manifest file name is invalid");
+                rc = ESP_FAIL;
+            } else {
+                ota_str_copy(sha_out, sha_sz, sha);
+                ota_str_copy(file_out, file_sz, file);
+            }
+            cJSON_Delete(root);
+        }
+    }
+    free(dl.mem);
+
+    if (rc != ESP_OK) {
+        ota_str_copy(err, errsz, dl.err[0] ? dl.err : "manifest download failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ota_download_image(const char *url, const char *path,
+                                    uint64_t max_size, uint64_t *size_out,
+                                    char *sha_hex_out, size_t sha_hex_sz,
+                                    char *err, size_t errsz)
+{
+    ota_dl_t dl = {0};
+    dl.kind = OTA_DL_IMAGE;
+    dl.total = -1;
+
+    FILE *fp = NULL;
+    uint8_t *buf = NULL;
+    mbedtls_sha256_context sha;
+    bool sha_started = false;
+    esp_http_client_handle_t client = NULL;
+    esp_err_t rc = ESP_FAIL;
+    uint64_t written = 0;
+    uint8_t digest[32];
+
+    client = ota_http_init(url, &dl);
+    if (!client) {
+        ota_str_copy(err, errsz, "cannot create HTTP client");
+        return ESP_ERR_NO_MEM;
+    }
+    rc = ota_http_open(client, &dl);
+    if (rc == ESP_OK && dl.total <= 0) {
+        ota_dl_error(&dl, "firmware size unavailable");
+        rc = ESP_FAIL;
+    }
+    if (rc == ESP_OK && (uint64_t)dl.total < OTA_MIN_IMAGE) {
+        ota_dl_error(&dl, "firmware size is too small");
+        rc = ESP_FAIL;
+    }
+    if (rc == ESP_OK && (uint64_t)dl.total > max_size) {
+        ota_dl_error(&dl, "firmware does not fit the OTA partition");
+        rc = ESP_FAIL;
+    }
+    if (rc == ESP_OK) {
+        pwn_sd_info_t sd;
+        if (!capture_sd_info(&sd) || !sd.ready || !sd.writable) {
+            ota_dl_error(&dl, "SD card is missing or not writable");
+            rc = ESP_FAIL;
+        } else if (sd.free_bytes < (uint64_t)dl.total + OTA_SD_RESERVE) {
+            ota_dl_error(&dl, "not enough SD space (need %llu bytes, %llu free)",
+                         (unsigned long long)((uint64_t)dl.total + OTA_SD_RESERVE),
+                         (unsigned long long)sd.free_bytes);
+            rc = ESP_FAIL;
+        }
+    }
+    if (rc == ESP_OK) {
+        fp = fopen(path, "wb");
+        if (!fp) {
+            ota_dl_error(&dl, "cannot create %s (errno %d)", path, errno);
+            rc = ESP_FAIL;
+        }
+    }
+    if (rc == ESP_OK) {
+        buf = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!buf) {
+            buf = malloc(4096);
+        }
+        if (!buf) {
+            ota_dl_error(&dl, "out of memory for download buffer");
+            rc = ESP_FAIL;
+        }
+    }
+    if (rc == ESP_OK) {
+        mbedtls_sha256_init(&sha);
+        sha_started = true;
+        if (mbedtls_sha256_starts(&sha, 0) != 0) {
+            ota_dl_error(&dl, "SHA-256 init failed");
+            rc = ESP_FAIL;
+        }
+    }
+    while (rc == ESP_OK && written < (uint64_t)dl.total) {
+        size_t want = 4096;
+        if ((uint64_t)want > (uint64_t)dl.total - written) {
+            want = (size_t)((uint64_t)dl.total - written);
+        }
+        int n = esp_http_client_read(client, (char *)buf, (int)want);
+        if (n < 0) {
+            ota_dl_error(&dl, "download read failed");
+            rc = ESP_FAIL;
+            break;
+        }
+        if (n == 0) {
+            ota_dl_error(&dl, "download ended early");
+            rc = ESP_FAIL;
+            break;
+        }
+        mbedtls_sha256_update(&sha, buf, (size_t)n);
+        if (!capture_bus_lock(3000)) {
+            ota_dl_error(&dl, "display/SD bus lock timeout");
+            rc = ESP_FAIL;
+            break;
+        }
+        size_t w = fwrite(buf, 1, (size_t)n, fp);
+        int saved_errno = errno;
+        capture_bus_unlock();
+        if (w != (size_t)n) {
+            ota_dl_error(&dl, "SD write failed (errno %d)", saved_errno);
+            rc = ESP_FAIL;
+            break;
+        }
+        written += (uint64_t)n;
+        int pct = (int)((written * 90) / (uint64_t)dl.total);
+        if (pct > 90) {
+            pct = 90;
+        }
+        ota_progress_set(pct);
+    }
+
+    if (fp) {
+        if (fclose(fp) != 0 && rc == ESP_OK) {
+            ota_dl_error(&dl, "SD close failed (errno %d)", errno);
+            rc = ESP_FAIL;
+        }
+        fp = NULL;
+    }
+    if (rc == ESP_OK && written != (uint64_t)dl.total) {
+        ota_dl_error(&dl, "download incomplete");
+        rc = ESP_FAIL;
+    }
+    if (rc == ESP_OK) {
+        if (sha_hex_sz < 65) {
+            ota_dl_error(&dl, "SHA-256 output buffer too small");
+            rc = ESP_FAIL;
+        } else if (mbedtls_sha256_finish(&sha, digest) != 0) {
+            ota_dl_error(&dl, "SHA-256 finish failed");
+            rc = ESP_FAIL;
+        } else {
+            ota_hex_encode(digest, sizeof(digest), sha_hex_out);
+        }
+    }
+    if (sha_started) {
+        mbedtls_sha256_free(&sha);
+    }
+    free(buf);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (rc != ESP_OK) {
+        ota_str_copy(err, errsz, dl.err[0] ? dl.err : "firmware download failed");
+        return ESP_FAIL;
+    }
+    *size_out = written;
+    return ESP_OK;
+}
+
+static esp_err_t ota_flash_image(const char *path, uint64_t size,
+                                 const esp_partition_t *part,
+                                 char *err, size_t errsz)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        ota_str_copy(err, errsz, "cannot reopen downloaded image");
+        return ESP_FAIL;
+    }
+    uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = malloc(4096);
+    }
+    if (!buf) {
+        fclose(fp);
+        ota_str_copy(err, errsz, "out of memory for flash buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t rc = esp_ota_begin(part, (size_t)size, &ota);
+    if (rc != ESP_OK) {
+        free(buf);
+        fclose(fp);
+        ota_str_copy(err, errsz, esp_err_to_name(rc));
+        return ESP_FAIL;
+    }
+
+    uint64_t done = 0;
+    while (done < size) {
+        size_t want = 4096;
+        if ((uint64_t)want > size - done) {
+            want = (size_t)(size - done);
+        }
+        if (!capture_bus_lock(3000)) {
+            rc = ESP_FAIL;
+            ota_str_copy(err, errsz, "display/SD bus lock timeout");
+            break;
+        }
+        size_t n = fread(buf, 1, want, fp);
+        int saved_errno = errno;
+        capture_bus_unlock();
+        if (n == 0) {
+            rc = ESP_FAIL;
+            ota_str_copy(err, errsz, "image read failed");
+            ESP_LOGE(TAG, "GitHub OTA: image read errno %d", saved_errno);
+            break;
+        }
+        rc = esp_ota_write(ota, buf, n);
+        if (rc != ESP_OK) {
+            ota_str_copy(err, errsz, esp_err_to_name(rc));
+            break;
+        }
+        done += n;
+        ota_progress_set(95 + (int)((done * 5) / size));
+    }
+    free(buf);
+    fclose(fp);
+
+    if (rc == ESP_OK && done != size) {
+        rc = ESP_FAIL;
+        ota_str_copy(err, errsz, "image read incomplete");
+    }
+    if (rc != ESP_OK) {
+        esp_ota_abort(ota);
+        return ESP_FAIL;
+    }
+    rc = esp_ota_end(ota);
+    if (rc != ESP_OK) {
+        ota_str_copy(err, errsz, esp_err_to_name(rc));
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static void github_ota_task(void *arg)
 {
     (void)arg;
-    ESP_LOGW(TAG, "GitHub OTA: %s", PWN_OTA_URL);
+    char err[OTA_ERR_MAX] = "";
+    char manifest_sha[65] = "";
+    char file[64] = "";
+    char url[256];
+    char image_sha[65] = "";
+    uint64_t image_size = 0;
+
+    ESP_LOGW(TAG, "GitHub OTA: manifest %s", PWN_OTA_MANIFEST_URL);
+    ota_state_set(OTA_ST_DOWNLOADING, NULL);
+
     if (!ota_sync_time()) {
-        ESP_LOGE(TAG, "GitHub OTA: NTP time sync failed");
-        s_github_ota_busy = false;
-        vTaskDelete(NULL);
-        return;
+        ota_fail("NTP time sync failed");
+        goto done;
     }
-    esp_http_client_config_t http = {
-        .url = PWN_OTA_URL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 30000,
-        .keep_alive_enable = true,
-    };
-    esp_https_ota_config_t cfg = {
-        .http_config = &http,
-    };
-    esp_err_t err = esp_https_ota(&cfg);
-    if (err == ESP_OK) {
-        ESP_LOGW(TAG, "GitHub OTA complete; rebooting");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        ota_fail("no inactive OTA partition");
+        goto done;
     }
-    ESP_LOGE(TAG, "GitHub OTA failed: %s", esp_err_to_name(err));
+
+    ota_progress_set(1);
+    if (ota_fetch_manifest(manifest_sha, sizeof(manifest_sha),
+                           file, sizeof(file), err, sizeof(err)) != ESP_OK) {
+        ota_fail("manifest: %s", err);
+        goto done;
+    }
+    if (snprintf(url, sizeof(url), "%s%s", PWN_OTA_BASE_URL, file) >=
+        (int)sizeof(url)) {
+        ota_fail("manifest file name is too long");
+        goto done;
+    }
+
+    ESP_LOGW(TAG, "GitHub OTA: %s", url);
+    err[0] = '\0';
+    ota_progress_set(5);
+    if (ota_download_image(url, PWN_OTA_TMP_FILE, part->size,
+                           &image_size, image_sha, sizeof(image_sha),
+                           err, sizeof(err)) != ESP_OK) {
+        ota_fail("download: %s", err);
+        goto done;
+    }
+
+    ota_state_set(OTA_ST_VERIFYING, NULL);
+    ota_progress_set(92);
+    ESP_LOGI(TAG, "GitHub OTA: manifest sha256=%s", manifest_sha);
+    ESP_LOGI(TAG, "GitHub OTA: download sha256=%s", image_sha);
+    if (strcasecmp(manifest_sha, image_sha) != 0) {
+        ota_fail("SHA-256 mismatch; refusing to flash");
+        goto done;
+    }
+
+    ota_state_set(OTA_ST_FLASHING, NULL);
+    ota_progress_set(95);
+    err[0] = '\0';
+    if (ota_flash_image(PWN_OTA_TMP_FILE, image_size, part,
+                        err, sizeof(err)) != ESP_OK) {
+        ota_fail("flash: %s", err);
+        goto done;
+    }
+    if (esp_ota_set_boot_partition(part) != ESP_OK) {
+        ota_fail("cannot select the new boot partition");
+        goto done;
+    }
+
+    ota_progress_set(100);
+    unlink(PWN_OTA_TMP_FILE);
+    ESP_LOGW(TAG, "GitHub OTA: SHA-256 verified, %llu bytes written to %s; "
+             "rebooting", (unsigned long long)image_size, part->label);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+done:
+    unlink(PWN_OTA_TMP_FILE);
     s_github_ota_busy = false;
     vTaskDelete(NULL);
 }
@@ -1417,12 +2021,19 @@ esp_err_t web_ota_github_start(void)
     if (!pwn_wifi_authorized()) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_github_ota_busy) {
+    taskENTER_CRITICAL(&s_ota_mux);
+    bool busy = s_github_ota_busy;
+    if (!busy) {
+        s_github_ota_busy = true;
+    }
+    taskEXIT_CRITICAL(&s_ota_mux);
+    if (busy) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_github_ota_busy = true;
+    ota_state_set(OTA_ST_DOWNLOADING, NULL);
+    ota_progress_set(0);
     if (xTaskCreate(github_ota_task, "pwn_gh_ota", 8192, NULL, 5, NULL) != pdPASS) {
-        s_github_ota_busy = false;
+        ota_fail("cannot start OTA task");
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -1445,13 +2056,17 @@ static esp_err_t ota_github_post(httpd_req_t *req)
         return fail(req, "409 Conflict", "OTA already running");
     }
     esp_err_t start_err = web_ota_github_start();
+    if (start_err == ESP_ERR_INVALID_STATE) {
+        return fail(req, "409 Conflict", "OTA already running");
+    }
     if (start_err != ESP_OK) {
         return fail(req, "500 Internal Server Error", "cannot start OTA task");
     }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "started", true);
-    cJSON_AddStringToObject(r, "url", PWN_OTA_URL);
-    cJSON_AddStringToObject(r, "note", "device will download and reboot; watch serial/dashboard");
+    cJSON_AddStringToObject(r, "url", PWN_OTA_MANIFEST_URL);
+    cJSON_AddStringToObject(r, "note",
+                            "manifest SHA-256 is verified before flashing; device will reboot");
     return send_json(req, r);
 }
 

@@ -10,7 +10,7 @@
  * permission to test.
  * ---------------------------------------------------------------------- */
 
-#define PWN_VERSION "0.3.2"
+#define PWN_VERSION "0.3.3"
 
 /* Passive/active policy. Active deauthentication is still gated behind a
  * runtime authorization phrase, but is compiled in so the web UI and CLI can
@@ -65,5 +65,10 @@
 /* UI. */
 #define PWN_FACE_COLOR_HEX 0x8CF58C
 
-/* Manual GitHub OTA (only runs when requested from Settings; never automatic). */
-#define PWN_OTA_URL "https://raw.githubusercontent.com/darkLabz001/pwni-esp32-c5/ota/dist/esp32touch.bin"
+/* Manual GitHub OTA (only runs when requested from Settings; never automatic).
+ * The tag-pinned manifest is fetched first and its sha256 must match the
+ * downloaded image before anything is written to the inactive OTA slot. */
+#define PWN_OTA_BASE_URL \
+    "https://raw.githubusercontent.com/darkLabz001/pwni-esp32-c5/ota/dist/"
+#define PWN_OTA_MANIFEST_URL PWN_OTA_BASE_URL "ota.json"
+#define PWN_OTA_TMP_FILE PWN_SD_MOUNT "/ota.bin"
