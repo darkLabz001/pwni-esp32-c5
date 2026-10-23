@@ -375,6 +375,13 @@ static esp_err_t hs_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "frames", hs[i].nframes);
         cJSON_AddBoolToObject(o, "complete", hs[i].complete);
         cJSON_AddBoolToObject(o, "pmkid", hs[i].has_pmkid);
+        if (hs[i].has_pmkid) {
+            char pmkid_hex[33];
+            for (int k = 0; k < 16; k++) {
+                snprintf(pmkid_hex + k * 2, 3, "%02x", hs[i].pmkid[k]);
+            }
+            cJSON_AddStringToObject(o, "pmkid_hex", pmkid_hex);
+        }
         cJSON_AddBoolToObject(o, "saved", hs[i].saved);
         cJSON_AddStringToObject(o, "file", hs[i].file);
         cJSON_AddItemToArray(arr, o);

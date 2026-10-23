@@ -11,6 +11,8 @@ Examples:
     python3 tools/pwn_crack.py --list
     python3 tools/pwn_crack.py --crack /tmp/hs.pcap --bssid AA:BB:CC:DD:EE:FF \
         --wordlist /tmp/words.txt
+    python3 tools/pwn_crack.py --pmkid <32-hex> --bssid AA:BB:CC:DD:EE:FF \
+        --sta 11:22:33:44:55:66 --essid MyNetwork --wordlist /tmp/words.txt
 
 Only use captures from networks you own or are authorized to test.
 """
@@ -241,36 +243,20 @@ def clean_line(text: str) -> str:
 # aircrack-ng
 # ---------------------------------------------------------------------------
 
-def aircrack(pcap: Path, bssid: str, wordlist: Path,
-             essid: str = "", on_line=None) -> tuple[bool, str, str]:
-    """Run aircrack-ng. Returns (found, key, full_output)."""
-    exe = shutil.which("aircrack-ng")
-    if not exe:
-        raise RuntimeError("aircrack-ng is not installed (apt install aircrack-ng)")
-    if not pcap.exists():
-        raise RuntimeError(f"PCAP not found: {pcap}")
-    if not wordlist.exists():
-        raise RuntimeError(f"wordlist not found: {wordlist}")
-
-    cmd = [exe, "-w", str(wordlist)]
-    if bssid:
-        cmd += ["-b", bssid]
-    if essid:
-        cmd += ["-e", essid]
-    cmd.append(str(pcap))
-    use_auto_target = not bssid
-
+def _run_aircrack(cmd: list[str], on_line=None,
+                  stdin_data: str | None = None) -> tuple[bool, str, str]:
+    """Run aircrack-ng and stream its output. Returns (found, key, output)."""
     lines: list[str] = []
     key = ""
     found = False
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE if use_auto_target else subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
         text=True, bufsize=1,
     )
-    if use_auto_target and proc.stdin:
+    if stdin_data is not None and proc.stdin:
         try:
-            proc.stdin.write("1\n")
+            proc.stdin.write(stdin_data)
             proc.stdin.flush()
             proc.stdin.close()
         except Exception:
@@ -287,6 +273,87 @@ def aircrack(pcap: Path, bssid: str, wordlist: Path,
             key = m.group(1)
     proc.wait()
     return found, key, "\n".join(lines)
+
+
+def aircrack(pcap: Path, bssid: str, wordlist: Path,
+             essid: str = "", on_line=None) -> tuple[bool, str, str]:
+    """Run aircrack-ng against a PCAP. Returns (found, key, full_output)."""
+    exe = shutil.which("aircrack-ng")
+    if not exe:
+        raise RuntimeError("aircrack-ng is not installed (apt install aircrack-ng)")
+    if not pcap.exists():
+        raise RuntimeError(f"PCAP not found: {pcap}")
+    if not wordlist.exists():
+        raise RuntimeError(f"wordlist not found: {wordlist}")
+
+    cmd = [exe, "-w", str(wordlist)]
+    if bssid:
+        cmd += ["-b", bssid]
+    if essid:
+        cmd += ["-e", essid]
+    cmd.append(str(pcap))
+    use_auto_target = not bssid
+    return _run_aircrack(cmd, on_line, "1\n" if use_auto_target else None)
+
+
+def normalize_mac(mac: str) -> str:
+    """Return 12 lowercase hex digits, accepting colons/dashes."""
+    h = re.sub(r"[^0-9a-fA-F]", "", mac or "").lower()
+    if len(h) != 12:
+        raise ValueError(f"invalid MAC address: {mac!r} (want AA:BB:CC:DD:EE:FF)")
+    return h
+
+
+def normalize_pmkid(pmkid: str) -> str:
+    """Return 32 lowercase hex digits, accepting separators."""
+    h = re.sub(r"[^0-9a-fA-F]", "", pmkid or "").lower()
+    if len(h) != 32:
+        raise ValueError(f"invalid PMKID: {pmkid!r} (want 32 hex chars)")
+    return h
+
+
+def pmkid_string(pmkid: str, bssid: str, sta: str, essid: str,
+                 hex_essid: bool = True) -> str:
+    """Build the aircrack-ng -I string: PMKID*BSSID*STA*ESSID.
+
+    aircrack-ng 1.7 (and current master) hex-decodes the ESSID field, so the
+    default encodes the ESSID as hex.  Pass hex_essid=False for versions that
+    expect the ESSID verbatim.
+    """
+    pmk = normalize_pmkid(pmkid)
+    b = normalize_mac(bssid)
+    s = normalize_mac(sta)
+    if not essid:
+        raise ValueError("ESSID is required for PMKID cracking")
+    e = essid.encode("utf-8", "replace").hex() if hex_essid else essid
+    return f"{pmk}*{b}*{s}*{e}"
+
+
+def aircrack_pmkid(pmkid: str, bssid: str, sta: str, essid: str,
+                   wordlist: Path, on_line=None) -> tuple[bool, str, str]:
+    """Crack a PMKID with ``aircrack-ng -I``. Returns (found, key, output)."""
+    exe = shutil.which("aircrack-ng")
+    if not exe:
+        raise RuntimeError("aircrack-ng is not installed (apt install aircrack-ng)")
+    if not wordlist.exists():
+        raise RuntimeError(f"wordlist not found: {wordlist}")
+
+    cmd = [exe, "-I", pmkid_string(pmkid, bssid, sta, essid, hex_essid=True),
+           "-w", str(wordlist)]
+    found, key, output = _run_aircrack(cmd, on_line)
+
+    # Older/newer aircrack-ng builds may expect the ESSID verbatim instead of
+    # the hex form used by 1.7.  The hex form fails fast with this message, so
+    # retry once with the plain ESSID rather than silently cracking nothing.
+    if not found and "An ESSID is required" in output:
+        if on_line:
+            on_line("retrying PMKID with plain-text ESSID")
+        cmd[2] = pmkid_string(pmkid, bssid, sta, essid, hex_essid=False)
+        found2, key2, output2 = _run_aircrack(cmd, on_line)
+        output = output + "\n" + output2
+        found = found or found2
+        key = key2 or key
+    return found, key, output
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +580,9 @@ class App:
                         size = _fmt_size(f.get("size", 0))
                         break
             self._add_row(kind, h.get("ssid") or "", h.get("bssid") or "",
-                          state, file, size, "yes" if h.get("pmkid") else "")
+                          state, file, size, "yes" if h.get("pmkid") else "",
+                          sta=h.get("sta") or "",
+                          pmkid_hex=h.get("pmkid_hex") or "")
 
         for f in files:
             name = f.get("name", "")
@@ -526,11 +595,13 @@ class App:
             self._add_row("local", "", file_bssid(path.name), "local", str(path),
                           _fmt_size(path.stat().st_size if path.exists() else 0), "")
 
-    def _add_row(self, kind, ssid, bssid, state, file, size, pmkid) -> None:
+    def _add_row(self, kind, ssid, bssid, state, file, size, pmkid,
+                 sta="", pmkid_hex="") -> None:
         iid = str(len(self.rows))
         self.rows.append({
             "kind": kind, "ssid": ssid, "bssid": bssid, "state": state,
             "file": file, "size": size, "pmkid": pmkid,
+            "sta": sta, "pmkid_hex": pmkid_hex,
         })
         self.tree.insert("", "end", iid=iid, values=(kind, ssid, bssid, state, file, size, pmkid))
 
@@ -570,6 +641,33 @@ class App:
         if not wl.exists():
             messagebox.showerror("PWNI", f"Wordlist not found:\n{wl}\nChoose a wordlist (rockyou.txt or similar).")
             return
+
+        # A captured PMKID does not need a PCAP: aircrack-ng can crack it from
+        # the hash string alone.  Use it whenever the selected row has one.
+        pmkid_hex = row.get("pmkid_hex") or ""
+        if pmkid_hex:
+            bssid = row["bssid"]
+            sta = row.get("sta") or ""
+            essid = row["ssid"]
+            if not sta or not essid:
+                messagebox.showerror(
+                    "PWNI",
+                    "PMKID cracking needs the station MAC and SSID. "
+                    "This row is missing one of them.")
+                return
+            try:
+                pmkid_str = pmkid_string(pmkid_hex, bssid, sta, essid)
+            except ValueError as exc:
+                messagebox.showerror("PWNI", f"invalid PMKID capture: {exc}")
+                return
+            self.msgq.put(("busy", True))
+            self.msgq.put(("result", "Cracking PMKID..."))
+            self.msgq.put(("log", f"aircrack-ng -I {pmkid_str} -w {wl}"))
+            threading.Thread(target=self._crack_pmkid_worker,
+                             args=(pmkid_hex, bssid, sta, essid, wl),
+                             daemon=True).start()
+            return
+
         if row["kind"] in ("live", "handshake") and not row["file"]:
             messagebox.showerror("PWNI", "This handshake has no saved PCAP. It is RAM-only; wait for the device to save a complete handshake.")
             return
@@ -588,6 +686,25 @@ class App:
         self.msgq.put(("log", f"aircrack-ng {'-b '+bssid if bssid else '(auto target)'} "
                               f"{'-e '+essid if essid else ''} -w {wl} {pcap}"))
         threading.Thread(target=self._crack_worker, args=(pcap, bssid, essid, wl), daemon=True).start()
+
+    def _crack_pmkid_worker(self, pmkid_hex: str, bssid: str, sta: str,
+                            essid: str, wordlist: Path) -> None:
+        try:
+            found, key, output = aircrack_pmkid(
+                pmkid_hex, bssid, sta, essid, wordlist,
+                on_line=lambda line: self.msgq.put(("log", line)),
+            )
+            if found:
+                self.msgq.put(("result", f"KEY FOUND: {key}"))
+                self.msgq.put(("log", f"KEY FOUND! [{key}]"))
+            else:
+                self.msgq.put(("result", "No key found with this wordlist."))
+                self.msgq.put(("log", "No key found with this wordlist."))
+        except Exception as exc:
+            self.msgq.put(("log", f"ERROR: {exc}"))
+            self.msgq.put(("result", f"ERROR: {exc}"))
+        finally:
+            self.msgq.put(("busy", False))
 
     def _crack_worker(self, pcap: Path, bssid: str, essid: str, wordlist: Path) -> None:
         try:
@@ -709,8 +826,9 @@ def cmd_list(ip: str | None, scan: bool) -> int:
         if f:
             seen_files.add(f)
         state = "complete" if h.get("complete") else "partial"
+        pmk = h.get("pmkid_hex") or ("PMKID" if h.get("pmkid") else "")
         print(f"  {state:8} {h.get('ssid',''):24} {h.get('bssid','')} "
-              f"{'PMKID' if h.get('pmkid') else ''} {f or '(RAM)'}")
+              f"{pmk:32} {f or '(RAM)'}")
     for f in hs.get("files", []):
         print(f"  file     {f.get('name')}  {_fmt_size(f.get('size', 0))}")
     return 0
@@ -719,6 +837,31 @@ def cmd_list(ip: str | None, scan: bool) -> int:
 def cmd_crack(pcap: str, bssid: str, essid: str, wordlist: str) -> int:
     found, key, output = aircrack(Path(pcap), bssid, Path(wordlist), essid,
                                   on_line=lambda line: print(line, flush=True))
+    if found:
+        print(f"\nKEY FOUND: {key}")
+        return 0
+    print("\nNo key found.")
+    return 1
+
+
+def cmd_pmkid(pmkid: str, bssid: str, sta: str, essid: str,
+              wordlist: str) -> int:
+    if not bssid or not sta or not essid:
+        print("--pmkid requires --bssid, --sta and --essid", file=sys.stderr)
+        return 2
+    try:
+        pmkid_str = pmkid_string(pmkid, bssid, sta, essid)
+    except ValueError as exc:
+        print(f"invalid PMKID arguments: {exc}", file=sys.stderr)
+        return 2
+    print(f"aircrack-ng -I {pmkid_str} -w {wordlist}", flush=True)
+    try:
+        found, key, _ = aircrack_pmkid(pmkid, bssid, sta, essid,
+                                       Path(wordlist),
+                                       on_line=lambda line: print(line, flush=True))
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     if found:
         print(f"\nKEY FOUND: {key}")
         return 0
@@ -784,10 +927,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--crack", metavar="PCAP", help="crack a local PCAP and exit")
     ap.add_argument("--crack-dir", metavar="DIR", help="crack every PCAP in a directory and exit")
     ap.add_argument("--verify-dir", metavar="DIR", help="check handshake quality for every PCAP in a directory")
-    ap.add_argument("--bssid", default="", help="BSSID for --crack")
-    ap.add_argument("--essid", default="", help="ESSID for --crack (PCAPs from the device have no beacons)")
+    ap.add_argument("--pmkid", metavar="HEX",
+                    help="crack a PMKID (32 hex chars) and exit; needs --bssid, --sta, --essid")
+    ap.add_argument("--bssid", default="", help="BSSID for --crack / --pmkid")
+    ap.add_argument("--sta", default="", help="station MAC for --pmkid")
+    ap.add_argument("--essid", default="",
+                    help="ESSID for --crack / --pmkid (PCAPs from the device have no beacons)")
     ap.add_argument("--wordlist", default=None,
-                    help="wordlist for --crack (default: best discovered, preferably rockyou)")
+                    help="wordlist for --crack / --pmkid / --crack-dir (default: best discovered, preferably rockyou)")
     args = ap.parse_args(argv)
 
     if args.list:
@@ -796,6 +943,9 @@ def main(argv: list[str] | None = None) -> int:
         for p in find_wordlists():
             print(p)
         return 0
+    if args.pmkid:
+        wordlist = args.wordlist or str(default_wordlist())
+        return cmd_pmkid(args.pmkid, args.bssid, args.sta, args.essid, wordlist)
     if args.crack:
         wordlist = args.wordlist or str(default_wordlist())
         return cmd_crack(args.crack, args.bssid, args.essid, wordlist)

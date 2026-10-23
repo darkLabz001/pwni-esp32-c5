@@ -42,6 +42,28 @@ BSSID and ESSID to aircrack-ng. Saved files are named
 `SSID_<12-hex-BSSID>.pcap`, which lets the tool recover both from files that
 are not in the live handshake table.
 
+## Crack a PMKID
+
+PMKID captures need no PCAP: the device reports the 16-byte PMKID in
+`/api/hs` as `pmkid_hex`, and the cracker builds the aircrack-ng hash string
+(`PMKID*BSSID*STA*ESSID`) directly.
+
+1. Select a row with a `PMKID` tag in the table.
+2. Choose the wordlist and click **Crack selected**.
+
+This works even when the row has no saved PCAP file. The command line
+equivalent is:
+
+```sh
+python3 tools/crack.py --pmkid <32-hex-pmkid> \
+  --bssid AA:BB:CC:DD:EE:FF --sta 11:22:33:44:55:66 \
+  --essid MyNetwork --wordlist /path/to/words.txt
+```
+
+`aircrack-ng 1.7` hex-decodes the ESSID field in `-I`, so the tool passes it
+hex-encoded and transparently retries with a plain ESSID if the installed
+build requires that instead.
+
 ## SD card
 
 The SD card stays in the device. The tool reads it through the device API:
@@ -98,9 +120,9 @@ python3 tools/crack.py --crack /path/hs.pcap \
 - `tkinter` for the GUI (installed here).
 - Wordlists: rockyou and the SecLists top-1M list are present under
   `tools/wordlists/`. `tools/get_wordlists.sh` re-downloads them if removed.
-- 4-way handshakes only. PMKID cracking is not automated; the device reports
-  PMKID captures, but this tool does not convert them to a hashcat/aircrack
-  PMKID string yet.
+- 4-way handshakes and PMKIDs. PMKID rows are cracked from the `-I` hash
+  string reported by the device, so they do not need a PCAP. 4-way handshakes
+  still need a saved or local PCAP.
 - PMF/802.11w clients cannot be deauthenticated with standard deauth frames;
   that does not affect offline PCAP cracking.
 - Only use captures from networks you own or have explicit permission to test.
