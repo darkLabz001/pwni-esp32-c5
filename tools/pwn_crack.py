@@ -727,6 +727,25 @@ def cmd_crack(pcap: str, bssid: str, essid: str, wordlist: str) -> int:
 
 
 
+
+def verify_pcap(pcap: Path) -> tuple[bool, str]:
+    exe = shutil.which("aircrack-ng")
+    if not exe:
+        return False, "aircrack-ng missing"
+    try:
+        r = subprocess.run([exe, "-w", "/dev/null", str(pcap)],
+                           input="1\n", text=True, capture_output=True, timeout=20)
+        out = r.stdout + r.stderr
+        import re as _re
+        m = _re.search(r"(\d+)\s+handshake", out)
+        if m and int(m.group(1)) > 0:
+            return True, f"{m.group(1)} handshake(s)"
+        if "PMKID" in out:
+            return True, "PMKID"
+        return False, "no usable handshake"
+    except Exception as exc:
+        return False, str(exc)
+
 def cmd_crack_dir(directory: str, bssid: str, essid: str, wordlist: str) -> int:
     d = Path(directory).expanduser()
     files = sorted(d.glob("*.pcap")) + sorted(d.glob("*.pcapng"))
@@ -764,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--wordlists", action="store_true", help="print discovered wordlists and exit")
     ap.add_argument("--crack", metavar="PCAP", help="crack a local PCAP and exit")
     ap.add_argument("--crack-dir", metavar="DIR", help="crack every PCAP in a directory and exit")
+    ap.add_argument("--verify-dir", metavar="DIR", help="check handshake quality for every PCAP in a directory")
     ap.add_argument("--bssid", default="", help="BSSID for --crack")
     ap.add_argument("--essid", default="", help="ESSID for --crack (PCAPs from the device have no beacons)")
     ap.add_argument("--wordlist", default=None,
@@ -782,6 +802,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.crack_dir:
         wordlist = args.wordlist or str(default_wordlist())
         return cmd_crack_dir(args.crack_dir, args.bssid, args.essid, wordlist)
+    if args.verify_dir:
+        d = Path(args.verify_dir).expanduser()
+        files = sorted(d.glob("*.pcap")) + sorted(d.glob("*.pcapng"))
+        if not files:
+            print(f"no PCAPs in {d}", file=sys.stderr)
+            return 2
+        ok = 0
+        for f in files:
+            good, msg = verify_pcap(f)
+            ok += 1 if good else 0
+            print(f"{f.name:48} {'OK' if good else '--':2}  {msg}")
+        print(f"\n{ok}/{len(files)} usable")
+        return 0 if ok else 1
 
     if tk is None:
         print("tkinter is not available; use --list or --crack", file=sys.stderr)
