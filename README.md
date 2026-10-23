@@ -224,8 +224,7 @@ Prebuilt firmware and the host tool are published at:
 
 - Download `esp32touch.bin`, `bootloader.bin`, `partition-table.bin`,
   `ota_data_initial.bin`, and `flash.sh`, then run `./flash.sh [port]`.
-- Update a reachable device from the latest release with
-  `tools/github_ota.sh <device-ip>` (or the dashboard's Maintenance upload).
+- Update a reachable device manually from **Settings → Maintenance → Update from GitHub**. The device downloads `dist/esp32touch.bin` from this repo; nothing is automatic.
 - The release tool zip contains the PCAP cracker and C5 deauth patch helper;
   wordlists are fetched by `tools/get_wordlists.sh`, not bundled.
 

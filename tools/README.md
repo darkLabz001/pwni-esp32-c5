@@ -105,15 +105,12 @@ python3 tools/crack.py --crack /path/hs.pcap \
   that does not affect offline PCAP cracking.
 - Only use captures from networks you own or have explicit permission to test.
 
-## OTA from GitHub
+## Device OTA from GitHub
 
-The firmware is published as a release asset on
-`darkLabz001/pwni-esp32-c5`. Update a reachable device with:
+Firmware updates are initiated from the device dashboard, not this host tool:
 
-```sh
-tools/github_ota.sh <device-ip> [phrase]
-```
+**Settings → Maintenance → Update from GitHub**
 
-The script downloads `esp32touch.bin` from the latest GitHub release,
-unlocks the device, uploads it to `/api/ota`, and waits for the reboot.
-You can also use the dashboard's **Maintenance -> Upload firmware** panel.
+The device downloads the current `dist/esp32touch.bin` from GitHub over HTTPS
+and reboots. There is no automatic check. OTA is gated by the authorization
+phrase.
