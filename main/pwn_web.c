@@ -1944,6 +1944,7 @@ static void github_ota_task(void *arg)
     char url[256];
     char image_sha[65] = "";
     uint64_t image_size = 0;
+    bool display_paused = false;
 
     ESP_LOGW(TAG, "GitHub OTA: manifest %s", PWN_OTA_MANIFEST_URL);
     ota_state_set(OTA_ST_DOWNLOADING, NULL);
@@ -1970,6 +1971,16 @@ static void github_ota_task(void *arg)
         ota_fail("manifest file name is too long");
         goto done;
     }
+
+    /* SD and LCD share one SPI bus. Stop the LVGL refresh worker before
+     * touching the card so a long download cannot collide with a panel
+     * flush; the web dashboard keeps reporting progress via /api/status. */
+    if (esp_lv_adapter_pause(5000) != ESP_OK) {
+        ota_fail("cannot pause the display for SD download");
+        goto done;
+    }
+    display_paused = true;
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     ESP_LOGW(TAG, "GitHub OTA: %s", url);
     err[0] = '\0';
@@ -2012,6 +2023,9 @@ static void github_ota_task(void *arg)
 
 done:
     unlink(PWN_OTA_TMP_FILE);
+    if (display_paused) {
+        esp_lv_adapter_resume();
+    }
     s_github_ota_busy = false;
     vTaskDelete(NULL);
 }
