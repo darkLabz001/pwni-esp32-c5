@@ -269,10 +269,12 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
     <div class="row" style="margin-top:12px">
       <input id="otaFile" type="file" accept=".bin">
       <button class="act danger" id="bOta">Upload firmware &amp; reboot</button>
+      <button class="act" id="bOtaGh">Update from GitHub</button>
     </div>
-    <div class="hint">Firmware update is gated by the authorization phrase.
-    Select the built <code>esp32touch.bin</code>; the device writes the inactive
-    OTA slot and reboots.</div>
+    <div class="hint">Firmware update is manual and gated by the authorization
+    phrase. <b>Update from GitHub</b> makes the device download the latest
+    <code>dist/esp32touch.bin</code> from the public repo and reboot. Nothing is
+    checked automatically.</div>
   </div>
   <div class="panel">
     <h2>System</h2>
@@ -471,6 +473,11 @@ $('#bResetBrain').onclick=async()=>{if(!confirm('Reset the learned strategy?'))r
   await post('/api/reset_brain',{});toast('brain reset');poll()};
 $('#bReboot').onclick=async()=>{if(!confirm('Reboot the device?'))return;
   toast('rebooting...');try{await post('/api/reboot',{})}catch(e){}};
+$('#bOtaGh').onclick=async()=>{
+  if(!confirm('Download the latest firmware from GitHub and reboot?'))return;
+  toast('contacting GitHub...');
+  try{const j=await post('/api/ota_github',{});toast('OTA started; device will reboot');}
+  catch(e){}};
 $('#bOta').onclick=async()=>{const f=$('#otaFile').files[0];
   if(!f)return toast('choose a firmware .bin',true);
   if(!confirm('Flash '+f.name+' and reboot?'))return;

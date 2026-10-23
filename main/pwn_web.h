@@ -6,3 +6,6 @@
  * has an IP. */
 esp_err_t web_start(void);
 void web_stop(void);
+
+/* Manual GitHub OTA (same as the Settings button). Requires authorization. */
+esp_err_t web_ota_github_start(void);

@@ -13,6 +13,10 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
+#include "esp_https_ota.h"
+#include "esp_crt_bundle.h"
+#include "esp_sntp.h"
+#include <time.h>
 #include "cJSON.h"
 #include "bsp/esp-bsp.h"
 #include "freertos/FreeRTOS.h"
@@ -1024,6 +1028,93 @@ static esp_err_t pcap_get(httpd_req_t *req)
 /* ---- server ----------------------------------------------------------- */
 
 
+
+static volatile bool s_github_ota_busy;
+
+static bool ota_sync_time(void)
+{
+    static bool started;
+    if (!started) {
+        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
+        started = true;
+    }
+    for (int i = 0; i < 24; i++) {
+        time_t now = time(NULL);
+        if (now > 1700000000) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return false;
+}
+
+static void github_ota_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "GitHub OTA: %s", PWN_OTA_URL);
+    if (!ota_sync_time()) {
+        ESP_LOGE(TAG, "GitHub OTA: NTP time sync failed");
+        s_github_ota_busy = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    esp_http_client_config_t http = {
+        .url = PWN_OTA_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 30000,
+        .keep_alive_enable = true,
+    };
+    esp_https_ota_config_t cfg = {
+        .http_config = &http,
+    };
+    esp_err_t err = esp_https_ota(&cfg);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "GitHub OTA complete; rebooting");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+    ESP_LOGE(TAG, "GitHub OTA failed: %s", esp_err_to_name(err));
+    s_github_ota_busy = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t web_ota_github_start(void)
+{
+    if (!pwn_wifi_authorized()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_github_ota_busy) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_github_ota_busy = true;
+    if (xTaskCreate(github_ota_task, "pwn_gh_ota", 8192, NULL, 5, NULL) != pdPASS) {
+        s_github_ota_busy = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ota_github_post(httpd_req_t *req)
+{
+    if (!pwn_wifi_authorized()) {
+        return fail(req, "403 Forbidden", "unlock attacks first");
+    }
+    if (s_github_ota_busy) {
+        return fail(req, "409 Conflict", "OTA already running");
+    }
+    esp_err_t start_err = web_ota_github_start();
+    if (start_err != ESP_OK) {
+        return fail(req, "500 Internal Server Error", "cannot start OTA task");
+    }
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "started", true);
+    cJSON_AddStringToObject(r, "url", PWN_OTA_URL);
+    cJSON_AddStringToObject(r, "note", "device will download and reboot; watch serial/dashboard");
+    return send_json(req, r);
+}
+
 static esp_err_t ota_post(httpd_req_t *req)
 {
     if (!pwn_wifi_authorized()) {
@@ -1120,6 +1211,7 @@ esp_err_t web_start(void)
         {.uri = "/api/reset_brain",  .method = HTTP_POST, .handler = reset_brain_post},
         {.uri = "/api/reboot",       .method = HTTP_POST, .handler = reboot_post},
         {.uri = "/api/ota",          .method = HTTP_POST, .handler = ota_post},
+        {.uri = "/api/ota_github",   .method = HTTP_POST, .handler = ota_github_post},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         err = httpd_register_uri_handler(s_server, &uris[i]);

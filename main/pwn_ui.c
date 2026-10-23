@@ -19,6 +19,7 @@
 #include "pwn_wifi.h"
 #include "pwn_capture.h"
 #include "pwn_net.h"
+#include "pwn_web.h"
 
 static const char *TAG = "ui";
 
@@ -857,6 +858,21 @@ static void btn_stop_deauth_cb(lv_event_t *e)
     toastf("deauth stopped");
 }
 
+static void github_ota_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!pwn_wifi_authorized()) {
+        toastf("unlock attacks first");
+        return;
+    }
+    esp_err_t err = web_ota_github_start();
+    if (err == ESP_OK) {
+        toastf("GitHub OTA started");
+    } else {
+        toastf("OTA busy or unavailable");
+    }
+}
+
 static void strat_cb(lv_event_t *e)
 {
     int sel = lv_dropdown_get_selected(lv_event_get_target(e));
@@ -1084,6 +1100,8 @@ static void build_settings(lv_obj_t *s)
     s_set_sys = label(p5, &lv_font_unscii_8, C_DIM, 12, 28, 280);
     label_lines(s_set_sys, 4);
     lv_label_set_text(s_set_sys, "");
+    b = text_btn(p5, "GITHUB OTA", 12, 78, 272, 34, false);
+    lv_obj_add_event_cb(b, github_ota_cb, LV_EVENT_CLICKED, NULL);
     b = text_btn(p5, "RESET BRAIN", 12, 124, 132, 36, false);
     lv_obj_add_event_cb(b, reset_brain_cb, LV_EVENT_CLICKED, NULL);
     b = text_btn(p5, "REBOOT", 156, 124, 132, 36, false);
