@@ -51,6 +51,7 @@ static volatile bool s_paused;
 static volatile bool s_authorized;
 static volatile bool s_locked;
 static volatile bool s_auto_deauth;
+static volatile bool s_ap_active;
 static volatile uint32_t s_dwell_ms = 5000;
 static volatile bool s_aggressive;
 static volatile uint8_t s_channels[PWN_ALL_COUNT_MAX];
@@ -640,7 +641,7 @@ static void recon_task(void *arg)
         uint32_t now = now_ms();
         if (s_paused) {
             last_hop = now;
-        } else if (!s_locked && now - last_hop >= s_dwell_ms) {
+        } else if (!s_locked && !s_ap_active && now - last_hop >= s_dwell_ms) {
             hop_next();
             last_hop = now;
         }
@@ -658,6 +659,16 @@ static void recon_task(void *arg)
 }
 
 /* ---- public API ------------------------------------------------------- */
+
+static void sniffer_enable(void)
+{
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(sniff_cb));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+}
 
 esp_err_t pwn_wifi_start(void)
 {
@@ -685,6 +696,9 @@ esp_err_t pwn_wifi_start(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    /* Create the AP netif now (but leave AP off) so the setup fallback can
+     * switch to APSTA later without allocating netifs from an event handler. */
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -711,12 +725,7 @@ esp_err_t pwn_wifi_start(void)
 
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    wifi_promiscuous_filter_t filter = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(sniff_cb));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    sniffer_enable();
 
     /* Start on channel 1 with the default 2.4 GHz plan. */
     for (int i = 0; i < PWN_2G_COUNT; i++) {
@@ -1111,7 +1120,7 @@ void pwn_wifi_set_locked(bool locked, uint8_t channel)
     } else if (s_locked) {
         s_locked = false;
         s_chan_idx = 0;
-        event("hopping resumed");
+        event(s_ap_active ? "AP keeps channel" : "hopping resumed");
     }
 }
 
@@ -1129,6 +1138,79 @@ void pwn_wifi_set_auto_deauth(bool on)
 bool pwn_wifi_auto_deauth(void)
 {
     return s_auto_deauth;
+}
+
+esp_err_t pwn_wifi_set_ap(bool on, const char *ssid)
+{
+    if (on) {
+        if (!ssid || !ssid[0]) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (s_ap_active) {
+            return ESP_OK;
+        }
+
+        wifi_config_t cfg = {0};
+        size_t n = strlen(ssid);
+        if (n > sizeof(cfg.ap.ssid)) {
+            n = sizeof(cfg.ap.ssid);
+        }
+        memcpy(cfg.ap.ssid, ssid, n);
+        cfg.ap.ssid_len = (uint8_t)n;
+        cfg.ap.channel = PWN_SETUP_AP_CHANNEL;
+        cfg.ap.max_connection = 2;
+        cfg.ap.authmode = WIFI_AUTH_OPEN;
+        cfg.ap.pmf_cfg.required = false;
+
+        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "APSTA switch failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = esp_wifi_set_config(WIFI_IF_AP, &cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "AP config failed: %s", esp_err_to_name(err));
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            return err;
+        }
+
+        s_ap_active = true;
+        /* APSTA keeps the station, but the radio can no longer hop without
+         * knocking setup clients off. Pin the sniffer to the AP channel. */
+        sniffer_enable();
+        esp_wifi_set_channel(PWN_SETUP_AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        s_stats.channel = PWN_SETUP_AP_CHANNEL;
+        s_stats.band = PWN_SETUP_AP_CHANNEL >= 36 ? 5 : 2;
+        ESP_LOGI(TAG, "setup AP up: %s ch %u (open)",
+                 ssid, (unsigned)PWN_SETUP_AP_CHANNEL);
+        event("setup AP %s", ssid);
+        return ESP_OK;
+    }
+
+    if (!s_ap_active) {
+        return ESP_OK;
+    }
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "STA-only switch failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_ap_active = false;
+    sniffer_enable();
+    if (!s_locked) {
+        s_chan_idx = 0;
+        event("setup AP stopped");
+        ESP_LOGI(TAG, "setup AP stopped; hopping resumed");
+    } else {
+        event("setup AP stopped, STA locked");
+        ESP_LOGI(TAG, "setup AP stopped; station keeps the channel");
+    }
+    return ESP_OK;
+}
+
+bool pwn_wifi_ap_active(void)
+{
+    return s_ap_active;
 }
 
 /* ---- built-in self test ---------------------------------------------- */
@@ -1332,6 +1414,13 @@ int pwn_wifi_scan_now(void)
     }
     xSemaphoreGive(s_tab_lock);
     free(recs);
+    /* A scan walks off the AP channel; bring the setup AP back promptly so
+     * connected phones do not lose the dashboard. */
+    if (s_ap_active && !s_locked) {
+        esp_wifi_set_channel(PWN_SETUP_AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        s_stats.channel = PWN_SETUP_AP_CHANNEL;
+        s_stats.band = PWN_SETUP_AP_CHANNEL >= 36 ? 5 : 2;
+    }
     event("scan found %u APs", got);
     return got;
 }

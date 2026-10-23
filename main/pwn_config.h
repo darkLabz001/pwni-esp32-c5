@@ -10,7 +10,7 @@
  * permission to test.
  * ---------------------------------------------------------------------- */
 
-#define PWN_VERSION "0.3.1"
+#define PWN_VERSION "0.3.2"
 
 /* Passive/active policy. Active deauthentication is still gated behind a
  * runtime authorization phrase, but is compiled in so the web UI and CLI can
@@ -23,6 +23,14 @@
  * Matching is case-insensitive. This is a speed bump, not a security
  * control; change it if you want something less guessable. */
 #define PWN_AUTH_PHRASE "ADMIN"
+
+/* Setup SoftAP used when there are no saved credentials, or when the station
+ * cannot join within PWN_SETUP_TIMEOUT_MS. The AP is intentionally open so a
+ * phone can join without typing a second password; the dashboard still uses
+ * the admin/ADMIN Basic auth. It stops as soon as the station gets an IP. */
+#define PWN_SETUP_AP_PREFIX  "PWNI-Setup"
+#define PWN_SETUP_AP_CHANNEL 1
+#define PWN_SETUP_TIMEOUT_MS 30000
 
 /* Regulatory domain used for channel access. Change to your country code.
  * Only affects which channels the radio is allowed to tune to. */

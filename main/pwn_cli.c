@@ -108,6 +108,18 @@ static void print_status(void)
            (unsigned)st->eapol, (unsigned)st->deauths,
            (unsigned)st->probes, (unsigned)st->beacons);
     printf("  active attacks: %s\n", st->authorized ? "ENABLED" : "disabled");
+    pwn_net_status_t net;
+    net_get_status(&net);
+    if (net.setup_mode || net.ap_active) {
+        printf("  setup AP: %s (open)  http://%s/\n", net.ap_ssid, net.ap_ip);
+    } else if (net.connected) {
+        printf("  station: %s  %s  ch %u  %d dBm\n", net.ssid, net.ip,
+               (unsigned)net.channel, net.rssi);
+    } else {
+        printf("  station: %s  (%s)\n",
+               net.have_creds ? net.ssid : "no saved network",
+               net.connecting ? "connecting" : "not connected");
+    }
     printf("  last: %s\n\n", st->last_event);
 }
 

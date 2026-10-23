@@ -15,4 +15,7 @@ flash without any server or host dependency.
 Release page: <https://github.com/darkLabz001/pwni-esp32-c5/releases/latest>
 
 The firmware includes no Wi-Fi credentials; credentials live in device NVS.
-Only use active features on networks you own or are authorized to test.
+With no saved credentials (or after 30 s of failed station joins) it starts an
+open `PWNI-Setup-XXXX` SoftAP at `http://192.168.4.1/` for dashboard-based
+provisioning; the AP stops after the station gets an IP. Only use active
+features on networks you own or are authorized to test.

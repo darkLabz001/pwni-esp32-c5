@@ -18,6 +18,7 @@
 - **On-device learning** — a compact REINFORCE MLP (8→16→6) chooses between six hop plans; weights persist in NVS.
 - **Touch UI** — animated face, moods, XP/level/bond, live stats, event log, network scanner, capture list, and settings. Bottom navigation: **FACE / SCAN / LOOT / SET**.
 - **On-device Wi-Fi setup** — scan from the device, pick an AP, type the password on the LVGL keyboard, and save credentials to NVS. Autoconnect is configurable.
+- **Setup AP fallback** — with no saved credentials, or after 30 seconds of failed station joins, the device starts an open `PWNI-Setup-XXXX` SoftAP at `http://192.168.4.1/` so the dashboard can be used to configure Wi-Fi. The AP is pinned to channel 1, channel hopping pauses, and the AP stops as soon as the station gets an IP. The setup AP has **no Wi-Fi password**; anyone in radio range can reach the dashboard while it is active, though the dashboard still requires `admin` / `ADMIN` Basic auth. Use it only long enough to join your own network.
 - **Web dashboard** — served on port 80 at `http://<device-ip>/` with live status, networks, clients, captures, PCAP download, attack controls, and settings.
 - **Host PCAP cracker** — `tools/pwn_crack.py` (alias `tools/crack.py`) auto-discovers the device, lists SD-backed handshakes, downloads PCAPs, and runs `aircrack-ng` with **rockyou.txt**, the **SecLists top-1M** list, or a custom wordlist. `tools/install_autostart.sh` starts it hidden at login and opens it when the device appears. See [tools/README.md](tools/README.md).
 - **Runtime-gated active attacks** — unlock with `ADMIN` (case-insensitive), then deauth from the device, web, or API. This workspace uses the patched C5 WiFi library, so frames are actually transmitted; stock ESP-IDF blocks them. Deauth runs as a configurable burst (5/8/15/30 s in web; 8 s on device) with **Stop** on both, shows **PMF** AP badges, and warns when PMF may make deauth ineffective. Locking and auto-deauth remain explicit user actions.
@@ -78,7 +79,7 @@ This connects immediately and saves the credentials to NVS. The password is not 
 
 ### Web dashboard
 
-Open `http://<device-ip>/` from a device on the same network. The dashboard has six tabs:
+Open `http://<device-ip>/` from a device on the same network. If the device is in setup mode, join the open `PWNI-Setup-XXXX` network and open `http://192.168.4.1/` instead; the dashboard shows a setup banner until the device joins your Wi-Fi. The dashboard has six tabs:
 
 - **Dash** — mood, level, bond, reward, live AP/client/capture counts, channel, strategy, recent events.
 - **Nets** — nearby APs with SSID/BSSID/channel/RSSI/security; scan and connect.
@@ -119,6 +120,8 @@ The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase
 
 `POST /api/hunt` returns immediately with `started`, the target `bssid`/`sta`, `duration_ms`, and a PMF `warning` when relevant. `/api/status` exposes `hunt_active`, `hunt_result` (`idle`, `hunting`, `captured`, `timeout`, `stopped`, `error`), `hunt_bssid`, `hunt_sta`, `hunt_elapsed_ms`, `hunt_duration_ms`, `hunt_file`, and `hunt_message`. The deauth burst is stopped as soon as a complete 4-way handshake or PMKID is saved for the target, or when the duration expires; hunts require the same runtime unlock as deauth.
 
+`/api/status` also exposes network state: `connected`, `connecting`, `have_creds`, `autoconnect`, `ssid`, `ip`, `rssi`, `sta_channel`, and the setup fallback fields `setup_mode`, `ap_active`, `ap_ssid`, and `ap_ip`. When `setup_mode` is true, use the existing Settings Wi-Fi panel at `http://192.168.4.1/`; submitting valid credentials starts a station join and the AP is removed once an IP is obtained.
+
 ## On-device UI
 
 | Tab | What it does |
@@ -126,7 +129,7 @@ The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase
 | **FACE** | Animated eyes/mouth, blink and mood changes, XP/level/bond, channel/AP/HS stats, last event. Tap the face to pet it. |
 | **SCAN** | AP list with RSSI bars, channel, security, WPS, and handshake badges. Tap a row for details, connect, or (after unlocking) deauth or run a 20-second **HUNT**. The scan button refreshes. |
 | **LOOT** | Captured handshakes from the current session, with BSSID and `PMKID` / `4WAY` / `SAVED` tags. Tap a row to show its file name. The web **Caps** tab also lists saved PCAPs from the SD card. |
-| **SET** | Wi-Fi connection and autoconnect, web dashboard URL with a scannable QR code, active-attack unlock/lock, auto-deauth, strategy override, display brightness and screen timeout, reset-brain, reboot. The settings page scrolls. |
+| **SET** | Wi-Fi connection and autoconnect, setup-AP SSID/URL with a scannable QR code when fallback is active, web dashboard URL with a QR code, active-attack unlock/lock, auto-deauth, strategy override, display brightness and screen timeout, reset-brain, reboot. The settings page scrolls. |
 
 The bottom navigation is always available. The backlight can be dimmed from the settings slider.
 
@@ -206,7 +209,7 @@ main/
 ├── pwn_capture.*       # EAPOL/PMKID parsing, slots, PCAP writer, SD mount
 ├── pwn_hunt.*          # Bounded deauth-assisted capture task
 ├── pwn_wifi.*          # Sniffer, AP/client tables, scan, hopping, deauth, selftest
-├── pwn_net.*           # STA manager, NVS credentials, autoconnect, channel lock
+├── pwn_net.*           # STA manager, setup SoftAP fallback, NVS credentials, channel lock
 ├── pwn_web.*           # HTTP server, JSON APIs, PCAP download
 ├── pwn_web_page.h      # Embedded dashboard HTML/JS/CSS
 ├── pwn_pet.*           # Moods, XP/bond, epochs, reward, learning loop
@@ -223,7 +226,8 @@ docs/                   # Hardware, architecture, legal notes
 - **`sd: false` or mount failures** — use a FAT32 card, reseat it, and check the boot log. The firmware tries 10 MHz; very slow or counterfeit cards may still fail. Use **Remount SD** in the web **SET** tab; the dashboard now shows free/total space. Complete/PMKID handshakes are queued immediately; partial M1+M2 stays in RAM until a complete handshake, slot eviction, or an explicit `save`/reboot flush.
 - **Handshake counts reset after reboot** — the live slot table is in RAM. Saved PCAPs remain on the card and are listed under **Caps → Saved PCAPs** in the web UI (and can still be downloaded by filename).
 - **Web page unreachable** — confirm the device is associated and use the exact IP from the boot log or `SET` screen. The dashboard is on port 80 and there is no mDNS. Client isolation on some hotspots blocks device-to-device traffic.
-- **Wi-Fi will not connect** — verify the password and security mode. The device scans 2.4 GHz and 5 GHz; the station connects on the AP's channel. Watch the serial log for the disconnect reason.
+- **Wi-Fi will not connect** — verify the password and security mode. The device scans 2.4 GHz and 5 GHz; the station connects on the AP's channel. Watch the serial log for the disconnect reason. After 30 seconds without a connection the device starts the open `PWNI-Setup-XXXX` SoftAP; join it and open `http://192.168.4.1/` to fix the credentials. The AP stops when the station gets an IP.
+- **Setup AP is visible but you do not want it** — it appears only with no saved credentials or after a failed join window, and it is removed as soon as the station connects. Save valid credentials from the dashboard's **Settings → WiFi connection** panel (or the device **SET** screen). There is no separate setup password, so keep the setup window short.
 - **UI freezes during heavy SD activity** — SD and LCD share SPI2; the firmware serializes access, but a failing card can still stall. Remove the card and reboot to confirm.
 - **Deauth returns 403** — active attacks are locked. Unlock with `ADMIN` (case-insensitive) in `SET`, the CLI, or `/api/auth`. While associated, deauth/hop requests that need an exclusive radio return `409`.
 - **Deauth says `0 frames` or `tx_error: ESP_ERR_INVALID_ARG`** — you are unlocked, but the C5 Wi-Fi library is refusing the frame. Run `python3 tools/patch_c5_deauth.py --check`. If it says `STOCK`, apply the patch (`--apply`), run `idf.py fullclean && idf.py build`, and reflash. If it says `PATCHED`, the target is on another channel while associated (disconnect first), the BSSID/station is invalid, or the client uses protected management frames (PMF). See [docs/C5_DEAUTH.md](docs/C5_DEAUTH.md).
@@ -233,7 +237,7 @@ docs/                   # Hardware, architecture, legal notes
 
 ## Dashboard login
 
-The web dashboard uses HTTP Basic auth: user `admin`, password `ADMIN` (the same runtime phrase). It is a LAN speed bump, not TLS; do not expose the device directly to the internet.
+The web dashboard uses HTTP Basic auth: user `admin`, password `ADMIN` (the same runtime phrase). It is a LAN speed bump, not TLS; do not expose the device directly to the internet. The setup SoftAP is open at the Wi-Fi layer, so treat it as a short-lived provisioning network and join your real Wi-Fi promptly.
 
 ## Releases and OTA
 

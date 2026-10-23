@@ -85,6 +85,11 @@ border:1px solid #263a29;color:var(--dim)}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2))}
 .event{color:var(--dim);font-size:12px;margin-top:6px;min-height:18px}
 .hint{color:var(--dim);font-size:12px;margin-top:8px}
+.banner{display:none;background:#241d0a;border-bottom:1px solid #5a4718;color:var(--warn);
+padding:11px 16px;font-size:12px;line-height:1.5}
+.banner b{color:#ffd98a;letter-spacing:1px}
+.banner a{color:var(--warn);font-weight:700}
+.banner .open{color:var(--bad)}
 pre{white-space:pre-wrap;word-break:break-all;color:var(--dim);font-size:12px;margin:0}
 footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
 @media(max-width:600px){.big{font-size:22px}td,th{padding:7px 4px}main{padding:12px}}
@@ -106,6 +111,15 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
   <button data-tab="attack">Attacks</button>
   <button data-tab="set">Settings</button>
 </nav>
+<div id="setupBanner" class="banner">
+  <b>SETUP MODE</b> &middot; join <b id="apSsid">PWNI-Setup</b>
+  (<span class="open">open network</span>) and open
+  <a id="apUrl" href="http://192.168.4.1/">http://192.168.4.1/</a>.
+  Configure your Wi-Fi in <b>Settings</b>. The setup AP has no Wi-Fi password,
+  so anyone nearby can reach this dashboard while it is active; it turns off
+  as soon as the device joins your network. Dashboard login remains
+  <b>admin / ADMIN</b>.
+</div>
 <main>
 
 <section id="dash" class="active">
@@ -328,9 +342,17 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==='attack'){loadNets(true).then(loadHuntClients);$('#strategy').value=String(S.action_override??-1);}
 });
 function renderStatus(){
-  $('#dot').className='dot '+(S.connected?'on':(S.connecting?'warn':''));
-  $('#hstate').textContent=S.connected?('online '+(S.ssid||'')):(S.connecting?'connecting...':'no wifi');
-  $('#hip').textContent=S.connected?('http://'+S.ip):'offline';
+  const setup=!!(S.setup_mode||S.ap_active);
+  const apUrl='http://'+((S.ap_ip&&S.ap_ip.length)?S.ap_ip:'192.168.4.1')+'/';
+  $('#setupBanner').style.display=setup?'block':'none';
+  if(setup){
+    $('#apSsid').textContent=S.ap_ssid||'PWNI-Setup';
+    $('#apUrl').textContent=apUrl;$('#apUrl').href=apUrl;
+  }
+  $('#dot').className='dot '+(S.connected?'on':((S.connecting||setup)?'warn':''));
+  $('#hstate').textContent=S.connected?('online '+(S.ssid||'')):
+    (setup?'setup mode':(S.connecting?'connecting...':'no wifi'));
+  $('#hip').textContent=S.connected?('http://'+S.ip):(setup?apUrl:'offline');
   $('#mood').textContent=S.mood||'--';$('#pstatus').textContent=S.status||'';
   $('#level').textContent=S.level;$('#xp').textContent=S.xp;$('#bond').textContent=S.bond;
   $('#aps').textContent=S.ap_count;$('#clientStat').textContent=S.client_count;
@@ -362,8 +384,12 @@ function renderStatus(){
   if(S.auto_deauth!==undefined && S.auto_deauth && !S.authorized){$('#autoDeauth').checked=false}
   $('#wifiState').innerHTML = S.connected
     ?('<span class="tag good">connected</span> '+esc(S.ssid)+' &middot; '+esc(S.ip)+' &middot; ch '+S.sta_channel+' &middot; '+S.rssi+' dBm')
-    :(S.connecting?'<span class="tag warn">connecting</span> '+esc(S.ssid||''):
-      (S.have_creds?'<span class="tag">disconnected</span> saved: '+esc(S.ssid):'<span class="sub">no saved network</span>'));
+    :(S.connecting?'<span class="tag warn">connecting</span> '+esc(S.ssid||'')+
+        (setup?' &middot; setup AP stays available':'')
+      :(setup?'<span class="tag warn">setup AP</span> '+esc(S.ap_ssid||'')+
+        ' &middot; '+apUrl+(S.have_creds?' &middot; last saved: '+esc(S.ssid):'')
+      :(S.have_creds?'<span class="tag">disconnected</span> saved: '+esc(S.ssid):
+        '<span class="sub">no saved network</span>')));
   $('#autoConn').checked=!!S.autoconnect;
   if(S.build){$('#sys').textContent=
     'firmware   PWNI '+S.build.version+'\n'+

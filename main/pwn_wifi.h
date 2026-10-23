@@ -139,6 +139,12 @@ bool pwn_wifi_locked(void);
 void pwn_wifi_set_auto_deauth(bool on);
 bool pwn_wifi_auto_deauth(void);
 
+/* Setup SoftAP. Enabling switches the radio to APSTA and pins the sniffer to
+ * the AP channel so hopping cannot tear down the setup link. Disabling
+ * returns to plain STA (the station, if connected, is left alone). */
+esp_err_t pwn_wifi_set_ap(bool on, const char *ssid);
+bool      pwn_wifi_ap_active(void);
+
 /* Inject a synthetic beacon + PMKID-bearing handshake through the same
  * parser used by the sniffer and verify the resulting PCAP. Returns 0 on
  * success, negative on failure. */

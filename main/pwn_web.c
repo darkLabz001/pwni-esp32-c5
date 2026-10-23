@@ -271,6 +271,10 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "connecting", net.connecting);
     cJSON_AddBoolToObject(r, "have_creds", net.have_creds);
     cJSON_AddBoolToObject(r, "autoconnect", net.autoconnect);
+    cJSON_AddBoolToObject(r, "setup_mode", net.setup_mode);
+    cJSON_AddBoolToObject(r, "ap_active", net.ap_active);
+    cJSON_AddStringToObject(r, "ap_ssid", net.ap_ssid);
+    cJSON_AddStringToObject(r, "ap_ip", net.ap_ip);
     cJSON_AddStringToObject(r, "ssid", net.ssid);
     cJSON_AddStringToObject(r, "ip", net.ip);
     cJSON_AddNumberToObject(r, "rssi", net.rssi);
@@ -480,6 +484,7 @@ static esp_err_t connect_post(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "ok", true);
     cJSON_AddBoolToObject(r, "connected", net_connected());
     cJSON_AddBoolToObject(r, "connecting", true);
+    cJSON_AddBoolToObject(r, "setup_mode", net_setup_active());
     return send_json(req, r);
 }
 

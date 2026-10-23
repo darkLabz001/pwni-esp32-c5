@@ -12,10 +12,14 @@ typedef struct {
     bool    connecting;
     bool    have_creds;
     bool    autoconnect;
+    bool    setup_mode;      /* setup fallback has been entered */
+    bool    ap_active;       /* SoftAP interface is running */
     char    ssid[33];
     char    ip[16];
     char    netmask[16];
     char    gw[16];
+    char    ap_ssid[33];
+    char    ap_ip[16];
     int8_t  rssi;
     uint8_t channel;
     uint8_t bssid[6];
@@ -35,6 +39,10 @@ esp_err_t net_forget(void);
 void net_get_status(pwn_net_status_t *out);
 bool net_connected(void);
 bool net_have_creds(void);
+bool net_setup_active(void);
+
+/* Force the provisioning SoftAP on/off. Normally driven automatically. */
+esp_err_t net_set_setup(bool on);
 
 void net_set_autoconnect(bool on);
 bool net_get_autoconnect(void);

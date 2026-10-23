@@ -1421,8 +1421,17 @@ static void ui_timer_cb(lv_timer_t *t)
             lv_label_set_text_fmt(s_set_conn,
                 "%s  %d dBm\nhttp://%s/", net.ssid, net.rssi, net.ip);
             lv_obj_set_style_text_color(s_set_conn, lv_color_hex(C_ACC), 0);
+        } else if ((net.setup_mode || net.ap_active) && !net.connecting) {
+            lv_label_set_text_fmt(s_set_conn, "SETUP AP %s\nhttp://%s/",
+                                  net.ap_ssid, net.ap_ip);
+            lv_obj_set_style_text_color(s_set_conn, lv_color_hex(C_WARN), 0);
         } else if (net.connecting) {
-            lv_label_set_text_fmt(s_set_conn, "connecting to %s...", net.ssid);
+            if (net.setup_mode || net.ap_active) {
+                lv_label_set_text_fmt(s_set_conn, "joining %s...\nAP %s",
+                                      net.ssid, net.ap_ssid);
+            } else {
+                lv_label_set_text_fmt(s_set_conn, "connecting to %s...", net.ssid);
+            }
             lv_obj_set_style_text_color(s_set_conn, lv_color_hex(C_WARN), 0);
         } else if (net.have_creds) {
             lv_label_set_text_fmt(s_set_conn, "disconnected\nsaved: %s", net.ssid);
@@ -1432,10 +1441,18 @@ static void ui_timer_cb(lv_timer_t *t)
             lv_obj_set_style_text_color(s_set_conn, lv_color_hex(C_DIM), 0);
         }
         if (s_set_web) {
+            const char *web_ip = NULL;
             if (net.connected && net.ip[0]) {
+                web_ip = net.ip;
+            } else if ((net.setup_mode || net.ap_active) && net.ap_ip[0]) {
+                web_ip = net.ap_ip;
+            }
+            if (web_ip) {
                 char url[32];
-                snprintf(url, sizeof(url), "http://%s/", net.ip);
+                snprintf(url, sizeof(url), "http://%s/", web_ip);
                 lv_label_set_text(s_set_web, url);
+                lv_obj_set_style_text_color(s_set_web,
+                    lv_color_hex(net.connected ? C_ACC2 : C_WARN), 0);
                 if (strcmp(url, s_qr_url) != 0) {
                     if (lv_qrcode_update(s_qr, url, strlen(url)) == LV_RESULT_OK) {
                         snprintf(s_qr_url, sizeof(s_qr_url), "%s", url);
