@@ -21,6 +21,7 @@
 - **Web dashboard** — served on port 80 at `http://<device-ip>/` with live status, networks, clients, captures, PCAP download, attack controls, and settings.
 - **Host PCAP cracker** — `tools/pwn_crack.py` (alias `tools/crack.py`) auto-discovers the device, lists SD-backed handshakes, downloads PCAPs, and runs `aircrack-ng` with **rockyou.txt**, the **SecLists top-1M** list, or a custom wordlist. `tools/install_autostart.sh` starts it hidden at login and opens it when the device appears. See [tools/README.md](tools/README.md).
 - **Runtime-gated active attacks** — unlock with `ADMIN` (case-insensitive), then deauth from the device, web, or API. This workspace uses the patched C5 WiFi library, so frames are actually transmitted; stock ESP-IDF blocks them. Deauth runs as a configurable burst (5/8/15/30 s in web; 8 s on device) with **Stop** on both, shows **PMF** AP badges, and warns when PMF may make deauth ineffective. Locking and auto-deauth remain explicit user actions.
+- **Capture hunt** — a bounded, deauth-assisted handshake capture. Pick a target AP (and optionally one observed client) in the web **Attacks** tab or from the device AP detail sheet; the firmware sends a limited deauth burst, polls the capture table, and stops as soon as a complete 4-way handshake or PMKID is saved, or after 20 s. It never targets the device's own STA, skips broadcast for the AP the device is associated with, and reports PMF warnings.
 - **Diagnostics** — `selftest` injects a synthetic handshake and verifies the resulting PCAP; `shot`, `tab`, and `touchtest` help with UI/touch bring-up.
 - **Stable clocks** — CPU 240 MHz, flash 80 MHz QIO, PSRAM 80 MHz quad. The build favors stability over the highest possible clock.
 
@@ -83,7 +84,7 @@ Open `http://<device-ip>/` from a device on the same network. The dashboard has 
 - **Nets** — nearby APs with SSID/BSSID/channel/RSSI/security; scan and connect.
 - **Clients** — observed stations with BSSID/RSSI.
 - **Caps** — captured handshakes and PMKIDs from this session, plus a **Saved PCAPs** table read from the SD card (survives reboots), with PCAP download.
-- **Attack** — authorization state, deauthentication, auto-deauth, pause/hop controls.
+- **Attack** — authorization state, deauthentication, capture hunt, auto-deauth, pause/hop controls.
 - **Set** — Wi-Fi connection, display brightness, maintenance, system information.
 
 ### API
@@ -104,6 +105,7 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 | POST | `/api/auth` | Unlock with `{"phrase":"..."}`; lock with `{"off":true}` |
 | POST | `/api/attacks` | Set auto-deauth (`auto`) while unlocked |
 | POST | `/api/deauth` | Start an 8-second deauth burst (`bssid`, `sta` or `all`, optional `duration_ms`, `interval_ms`, `reason`); `{"stop":true}` stops it; requires unlock |
+| POST | `/api/hunt` | Deauth-assisted capture hunt (`bssid`, optional `sta`, optional `duration_ms`, default 20 s, max 60 s); `{"stop":true}` stops it; requires unlock |
 | POST | `/api/hop` | Park the sniffer on a channel (blocked while associated) |
 | POST | `/api/hop_ap` | Park on an AP's channel (blocked while associated) |
 | POST | `/api/pause` | Pause/resume hopping (`paused`) |
@@ -115,12 +117,14 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 
 The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase is a deliberate speed bump, not a security boundary. `ADMIN` is intentionally weak and guessable; change `PWN_AUTH_PHRASE` in `main/pwn_config.h` if the device is accessible to others. Auto-deauth defaults to off. Deauth starts an 8-second burst and returns immediately; send `{"stop":true}` to stop it. Deauth and hop calls that need an exclusive radio return `409 Conflict` while associated.
 
+`POST /api/hunt` returns immediately with `started`, the target `bssid`/`sta`, `duration_ms`, and a PMF `warning` when relevant. `/api/status` exposes `hunt_active`, `hunt_result` (`idle`, `hunting`, `captured`, `timeout`, `stopped`, `error`), `hunt_bssid`, `hunt_sta`, `hunt_elapsed_ms`, `hunt_duration_ms`, `hunt_file`, and `hunt_message`. The deauth burst is stopped as soon as a complete 4-way handshake or PMKID is saved for the target, or when the duration expires; hunts require the same runtime unlock as deauth.
+
 ## On-device UI
 
 | Tab | What it does |
 |---|---|
 | **FACE** | Animated eyes/mouth, blink and mood changes, XP/level/bond, channel/AP/HS stats, last event. Tap the face to pet it. |
-| **SCAN** | AP list with RSSI bars, channel, security, WPS, and handshake badges. Tap a row for details, connect, or (after unlocking) deauth. The scan button refreshes. |
+| **SCAN** | AP list with RSSI bars, channel, security, WPS, and handshake badges. Tap a row for details, connect, or (after unlocking) deauth or run a 20-second **HUNT**. The scan button refreshes. |
 | **LOOT** | Captured handshakes from the current session, with BSSID and `PMKID` / `4WAY` / `SAVED` tags. Tap a row to show its file name. The web **Caps** tab also lists saved PCAPs from the SD card. |
 | **SET** | Wi-Fi connection and autoconnect, web dashboard URL with a scannable QR code, active-attack unlock/lock, auto-deauth, strategy override, display brightness and screen timeout, reset-brain, reboot. The settings page scrolls. |
 
@@ -130,7 +134,7 @@ The panel dims to 15% after 45 seconds without a touch and blanks after 60
 seconds by default. The first tap restores the slider level and is swallowed so
 it cannot press an invisible control. **SET → DISPLAY → sleep** offers 30 s,
 60 s, 2 min, 5 min, or off; the choice is stored in NVS. The panel stays awake
-while a text-entry/modal dialog is open, during an active deauth burst, and
+while a text-entry/modal dialog is open, during an active deauth burst or capture hunt, and
 during GitHub OTA. The dashboard QR is generated on-device from
 `http://<device-ip>/` and refreshes whenever the IP changes; offline it shows a
 `no link` placeholder.
@@ -200,6 +204,7 @@ main/
 ├── pwn_config.h        # Tunables and feature flags
 ├── pwn_brain.*         # REINFORCE MLP + hop policies
 ├── pwn_capture.*       # EAPOL/PMKID parsing, slots, PCAP writer, SD mount
+├── pwn_hunt.*          # Bounded deauth-assisted capture task
 ├── pwn_wifi.*          # Sniffer, AP/client tables, scan, hopping, deauth, selftest
 ├── pwn_net.*           # STA manager, NVS credentials, autoconnect, channel lock
 ├── pwn_web.*           # HTTP server, JSON APIs, PCAP download

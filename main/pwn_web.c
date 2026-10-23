@@ -25,6 +25,7 @@
 #include "pwn_config.h"
 #include "pwn_wifi.h"
 #include "pwn_capture.h"
+#include "pwn_hunt.h"
 #include "pwn_pet.h"
 #include "pwn_net.h"
 #include "pwn_web_page.h"
@@ -224,6 +225,31 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "authorized", pwn_wifi_authorized());
     cJSON_AddBoolToObject(r, "auto_deauth", pwn_wifi_auto_deauth());
     cJSON_AddBoolToObject(r, "deauth_active", pwn_wifi_deauth_active());
+
+    pwn_hunt_status_t hunt;
+    pwn_hunt_status(&hunt);
+    char hunt_bssid[18] = "";
+    char hunt_sta[18] = "";
+    if ((hunt.bssid[0] | hunt.bssid[1] | hunt.bssid[2] |
+         hunt.bssid[3] | hunt.bssid[4] | hunt.bssid[5]) != 0) {
+        mac_str(hunt.bssid, hunt_bssid);
+    }
+    if (hunt.have_sta &&
+        (hunt.sta[0] | hunt.sta[1] | hunt.sta[2] |
+         hunt.sta[3] | hunt.sta[4] | hunt.sta[5]) != 0) {
+        mac_str(hunt.sta, hunt_sta);
+    }
+    cJSON_AddBoolToObject(r, "hunt_active", hunt.active);
+    cJSON_AddStringToObject(r, "hunt_result",
+                            pwn_hunt_state_name(hunt.state));
+    cJSON_AddStringToObject(r, "hunt_bssid", hunt_bssid);
+    cJSON_AddStringToObject(r, "hunt_sta", hunt_sta);
+    cJSON_AddNumberToObject(r, "hunt_duration_ms", hunt.duration_ms);
+    cJSON_AddNumberToObject(r, "hunt_elapsed_ms", hunt.elapsed_ms);
+    cJSON_AddBoolToObject(r, "hunt_pmf", hunt.pmf);
+    cJSON_AddBoolToObject(r, "hunt_saved", hunt.saved);
+    cJSON_AddStringToObject(r, "hunt_file", hunt.file);
+    cJSON_AddStringToObject(r, "hunt_message", hunt.message);
     cJSON_AddStringToObject(r, "last_event",
                             st->last_event[0] ? st->last_event : "listening...");
     cJSON_AddBoolToObject(r, "sd", capture_sd_ready());
@@ -540,6 +566,7 @@ static esp_err_t auth_post(httpd_req_t *req)
     }
     if (cJSON_IsTrue(cJSON_GetObjectItem(body, "off"))) {
         pwn_wifi_set_authorized(false);
+        pwn_hunt_stop();
         cJSON_Delete(body);
         cJSON *r = cJSON_CreateObject();
         cJSON_AddBoolToObject(r, "authorized", false);
@@ -838,6 +865,116 @@ static esp_err_t deauth_post(httpd_req_t *req)
             cJSON_AddStringToObject(r, "tx_raw", hex);
         }
     }
+    return send_json(req, r);
+}
+
+static void hunt_add_status(cJSON *r, const pwn_hunt_status_t *h)
+{
+    char bssid[18] = "";
+    char sta[18] = "";
+    if ((h->bssid[0] | h->bssid[1] | h->bssid[2] |
+         h->bssid[3] | h->bssid[4] | h->bssid[5]) != 0) {
+        mac_str(h->bssid, bssid);
+    }
+    if (h->have_sta &&
+        (h->sta[0] | h->sta[1] | h->sta[2] |
+         h->sta[3] | h->sta[4] | h->sta[5]) != 0) {
+        mac_str(h->sta, sta);
+    }
+    cJSON_AddBoolToObject(r, "hunt_active", h->active);
+    cJSON_AddStringToObject(r, "hunt_result", pwn_hunt_state_name(h->state));
+    cJSON_AddStringToObject(r, "bssid", bssid);
+    cJSON_AddStringToObject(r, "sta", sta);
+    cJSON_AddNumberToObject(r, "duration_ms", h->duration_ms);
+    cJSON_AddNumberToObject(r, "elapsed_ms", h->elapsed_ms);
+    cJSON_AddBoolToObject(r, "pmf", h->pmf);
+    cJSON_AddBoolToObject(r, "saved", h->saved);
+    cJSON_AddStringToObject(r, "file", h->file);
+    cJSON_AddStringToObject(r, "message", h->message);
+}
+
+static esp_err_t hunt_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char buf[BODY_MAX];
+    cJSON *body = read_body(req, buf, sizeof(buf));
+    if (!body) {
+        return fail(req, "400 Bad Request", "invalid JSON");
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItem(body, "stop"))) {
+        pwn_hunt_stop();
+        cJSON_Delete(body);
+        pwn_hunt_status_t h;
+        pwn_hunt_status(&h);
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject(r, "stopped", true);
+        cJSON_AddBoolToObject(r, "hunt_active", h.active);
+        cJSON_AddStringToObject(r, "hunt_result",
+                                pwn_hunt_state_name(h.state));
+        return send_json(req, r);
+    }
+    if (!pwn_wifi_authorized()) {
+        cJSON_Delete(body);
+        return fail(req, "403 Forbidden", "unlock attacks first");
+    }
+
+    uint8_t bssid[6];
+    uint8_t sta[6];
+    bool have_sta = false;
+    if (!parse_mac(cJSON_GetStringValue(cJSON_GetObjectItem(body, "bssid")),
+                   bssid)) {
+        cJSON_Delete(body);
+        return fail(req, "400 Bad Request", "bssid required");
+    }
+    cJSON *sta_j = cJSON_GetObjectItem(body, "sta");
+    if (sta_j && cJSON_IsString(sta_j)) {
+        if (!parse_mac(sta_j->valuestring, sta)) {
+            cJSON_Delete(body);
+            return fail(req, "400 Bad Request", "invalid sta");
+        }
+        have_sta = true;
+    }
+    cJSON *duration_j = cJSON_GetObjectItem(body, "duration_ms");
+    int duration_ms = duration_j ? duration_j->valueint : 0;
+    cJSON_Delete(body);
+    if (duration_ms < 0) {
+        duration_ms = 0;
+    }
+    if (duration_ms > PWN_HUNT_MAX_MS) {
+        duration_ms = PWN_HUNT_MAX_MS;
+    }
+
+    char err[96] = "";
+    esp_err_t e = pwn_hunt_start(bssid, have_sta ? sta : NULL,
+                                 (uint32_t)duration_ms, err, sizeof(err));
+    if (e != ESP_OK) {
+        const char *status = "500 Internal Server Error";
+        if (e == ESP_ERR_INVALID_ARG) {
+            status = "400 Bad Request";
+        } else if (e == ESP_ERR_NOT_FOUND) {
+            status = "404 Not Found";
+        } else if (e == ESP_ERR_INVALID_STATE) {
+            status = "409 Conflict";
+        } else if (e == ESP_ERR_NO_MEM) {
+            status = "503 Service Unavailable";
+        }
+        return fail(req, status, err[0] ? err : esp_err_to_name(e));
+    }
+
+    pwn_hunt_status_t h;
+    pwn_hunt_status(&h);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "started", true);
+    hunt_add_status(r, &h);
+    if (h.pmf) {
+        cJSON_AddStringToObject(r, "warning",
+            "target advertises PMF; deauth may be ignored and the hunt may time out");
+    }
+    ESP_LOGW(TAG, "hunt started for %02x:%02x:%02x:%02x:%02x:%02x%s for %ums",
+             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+             have_sta ? " (single station)" : "", (unsigned)h.duration_ms);
     return send_json(req, r);
 }
 
@@ -1405,6 +1542,7 @@ esp_err_t web_start(void)
         {.uri = "/api/auth",         .method = HTTP_POST, .handler = auth_post},
         {.uri = "/api/attacks",      .method = HTTP_POST, .handler = attacks_post},
         {.uri = "/api/deauth",       .method = HTTP_POST, .handler = deauth_post},
+        {.uri = "/api/hunt",         .method = HTTP_POST, .handler = hunt_post},
         {.uri = "/api/hop",          .method = HTTP_POST, .handler = hop_post},
         {.uri = "/api/hop_ap",       .method = HTTP_POST, .handler = hop_ap_post},
         {.uri = "/api/pause",        .method = HTTP_POST, .handler = pause_post},

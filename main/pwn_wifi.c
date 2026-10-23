@@ -927,6 +927,25 @@ int pwn_wifi_ap_snapshot(pwn_ap_t *out, int max)
     return n;
 }
 
+bool pwn_wifi_ap_get(const uint8_t *bssid, pwn_ap_t *out)
+{
+    if (!bssid || !out || !s_tab_lock) {
+        return false;
+    }
+    bool found = false;
+    xSemaphoreTake(s_tab_lock, portMAX_DELAY);
+    for (int i = 0; i < PWN_MAX_APS; i++) {
+        if (s_aps[i].last_seen_ms &&
+            memcmp(s_aps[i].bssid, bssid, 6) == 0) {
+            *out = s_aps[i];
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_tab_lock);
+    return found;
+}
+
 int pwn_wifi_client_snapshot(pwn_client_t *out, int max)
 {
     if (!out || max <= 0 || !s_tab_lock) {

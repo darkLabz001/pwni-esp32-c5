@@ -85,6 +85,24 @@ int capture_list_files(pwn_pcap_file_t *out, int max);
 /* Copy the slot table for the CLI / UI. Returns number written. */
 int capture_snapshot(pwn_handshake_t *out, int max);
 
+/* Look for a saved (or still pending) complete 4-way handshake or PMKID for
+ * a BSSID / optional station. This scans the slot table under the capture
+ * lock, so callers do not need to allocate a full snapshot. Saved matches are
+ * preferred over unsaved ones. */
+typedef struct {
+    bool    found;
+    bool    saved;
+    bool    complete;
+    bool    has_pmkid;
+    uint8_t bssid[6];
+    uint8_t sta[6];
+    char    ssid[33];
+    char    file[96];
+} pwn_capture_hit_t;
+
+bool capture_find_usable(const uint8_t *bssid, const uint8_t *sta,
+                         bool have_sta, pwn_capture_hit_t *out);
+
 /* Basename of the last PCAP saved for (bssid, sta). Returns false if the
  * slot is unknown or has not been written to the card yet. */
 bool capture_file_for(const uint8_t *bssid, const uint8_t *sta,

@@ -19,6 +19,7 @@
 #include "pwn_pet.h"
 #include "pwn_wifi.h"
 #include "pwn_capture.h"
+#include "pwn_hunt.h"
 #include "pwn_net.h"
 #include "pwn_web.h"
 
@@ -678,6 +679,31 @@ static void ap_connect_cb(lv_event_t *e)
     }
 }
 
+static void ap_exec_hunt(void)
+{
+    char err[96] = "";
+    if (pwn_hunt_start(s_sel_ap.bssid, NULL, PWN_HUNT_DEFAULT_MS,
+                       err, sizeof(err)) == ESP_OK) {
+        toastf("hunt %us%s: %.12s", (unsigned)(PWN_HUNT_DEFAULT_MS / 1000),
+               s_sel_ap.pmf ? " (PMF may ignore)" : "",
+               s_sel_ap.ssid[0] ? s_sel_ap.ssid : "<hidden>");
+    } else {
+        toastf("%.48s", err[0] ? err : "hunt failed");
+    }
+}
+
+static void ap_hunt_cb(lv_event_t *e)
+{
+    (void)e;
+    close_modal();
+    if (!pwn_wifi_authorized()) {
+        toastf("unlock attacks first");
+        open_keyboard("AUTHORIZATION PHRASE", "", 1, NULL);
+        return;
+    }
+    ap_exec_hunt();
+}
+
 static void ap_deauth_cb(lv_event_t *e)
 {
     (void)e;
@@ -841,7 +867,7 @@ static void ap_clicked(lv_event_t *e)
     lv_obj_add_flag(s_modal, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_modal, kb_overlay_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *p = box(s_modal, 12, 130, 296, 210, C_PANEL);
+    lv_obj_t *p = box(s_modal, 12, 112, 296, 250, C_PANEL);
     lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
 
     char ssid[33];
@@ -868,7 +894,9 @@ static void ap_clicked(lv_event_t *e)
     lv_obj_add_event_cb(b2, ap_deauth_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *b3 = text_btn(p, "CLIENTS", 188, 120, 96, 40, false);
     lv_obj_add_event_cb(b3, clients_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *b4 = text_btn(p, "CLOSE", 12, 166, 272, 32, false);
+    lv_obj_t *bh = text_btn(p, "HUNT (20s)", 12, 166, 272, 32, false);
+    lv_obj_add_event_cb(bh, ap_hunt_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *b4 = text_btn(p, "CLOSE", 12, 204, 272, 32, false);
     lv_obj_add_event_cb(b4, close_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
@@ -1010,14 +1038,17 @@ static void btn_lock_cb(lv_event_t *e)
     (void)e;
     pwn_wifi_set_authorized(false);
     pwn_wifi_set_auto_deauth(false);
+    pwn_hunt_stop();
     toastf("attacks locked");
 }
 
 static void btn_stop_deauth_cb(lv_event_t *e)
 {
     (void)e;
+    bool hunting = pwn_hunt_active();
+    pwn_hunt_stop();
     pwn_wifi_deauth_stop();
-    toastf("deauth stopped");
+    toastf(hunting ? "hunt stopped" : "deauth stopped");
 }
 
 static void github_ota_cb(lv_event_t *e)
@@ -1450,8 +1481,12 @@ static void ui_timer_cb(lv_timer_t *t)
             }
         }
         if (s_set_deauth) {
-            lv_label_set_text(s_set_deauth,
-                pwn_wifi_deauth_active() ? "burst active" : "idle");
+            if (pwn_hunt_active()) {
+                lv_label_set_text(s_set_deauth, "hunt active");
+            } else {
+                lv_label_set_text(s_set_deauth,
+                    pwn_wifi_deauth_active() ? "burst active" : "idle");
+            }
         }
     }
     }
@@ -1509,7 +1544,7 @@ static void ui_timer_cb(lv_timer_t *t)
      * is running, and during GitHub OTA so progress stays visible.
      */
     bool hold_awake = (s_modal != NULL) || web_ota_busy() ||
-                      pwn_wifi_deauth_active();
+                      pwn_wifi_deauth_active() || pwn_hunt_active();
     uint32_t idle = lv_display_get_inactive_time(NULL);
     if (hold_awake) {
         if (s_dimmed || s_blanked) {

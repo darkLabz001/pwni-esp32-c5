@@ -839,6 +839,47 @@ int capture_snapshot(pwn_handshake_t *out, int max)
     return n;
 }
 
+bool capture_find_usable(const uint8_t *bssid, const uint8_t *sta,
+                         bool have_sta, pwn_capture_hit_t *out)
+{
+    if (!s_slots || !s_lock || !bssid || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* First pass returns a slot already written to SD; the second accepts a
+     * usable capture that is still waiting for the writer. */
+    for (int pass = 0; pass < 2 && !out->found; pass++) {
+        bool need_saved = (pass == 0);
+        for (int i = 0; i < PWN_MAX_HS; i++) {
+            pwn_handshake_t *h = &s_slots[i];
+            if (h->nframes == 0 || !(h->complete || h->has_pmkid)) {
+                continue;
+            }
+            if (memcmp(h->bssid, bssid, 6) != 0) {
+                continue;
+            }
+            if (have_sta && (!sta || memcmp(h->sta, sta, 6) != 0)) {
+                continue;
+            }
+            if (need_saved && !h->saved) {
+                continue;
+            }
+            out->found = true;
+            out->saved = h->saved;
+            out->complete = h->complete;
+            out->has_pmkid = h->has_pmkid;
+            memcpy(out->bssid, h->bssid, 6);
+            memcpy(out->sta, h->sta, 6);
+            snprintf(out->ssid, sizeof(out->ssid), "%s", h->ssid);
+            snprintf(out->file, sizeof(out->file), "%s", h->file);
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return out->found;
+}
+
 int capture_list_files(pwn_pcap_file_t *out, int max)
 {
     if (!s_sd_ready || !out || max <= 0) {

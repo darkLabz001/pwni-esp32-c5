@@ -115,6 +115,8 @@ void pwn_wifi_clear_last_tx(void);
 
 const pwn_wifi_stats_t *pwn_wifi_stats(void);
 int pwn_wifi_ap_snapshot(pwn_ap_t *out, int max);
+/* Copy one AP by BSSID without allocating a full snapshot. */
+bool pwn_wifi_ap_get(const uint8_t *bssid, pwn_ap_t *out);
 int pwn_wifi_client_snapshot(pwn_client_t *out, int max);
 
 void pwn_wifi_set_authorized(bool on);

@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.c"
         "pwn_brain.c"
         "pwn_capture.c"
+        "pwn_hunt.c"
         "pwn_wifi.c"
         "pwn_net.c"
         "pwn_web.c"

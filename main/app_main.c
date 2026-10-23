@@ -10,6 +10,7 @@
 #include "pwn_config.h"
 #include "pwn_wifi.h"
 #include "pwn_capture.h"
+#include "pwn_hunt.h"
 #include "pwn_pet.h"
 #include "pwn_ui.h"
 #include "pwn_cli.h"
@@ -43,6 +44,7 @@ void app_main(void)
      * share one SPI bus; mounting a card while the first frame is being
      * flushed stalls the panel transaction and trips the task watchdog. */
     capture_init();
+    pwn_hunt_init();
 
     lv_display_t *disp = bsp_display_start();
     if (!disp) {

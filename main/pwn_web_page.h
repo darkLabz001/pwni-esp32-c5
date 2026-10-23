@@ -215,6 +215,20 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
     are asleep or use PMF may ignore it).</div>
   </div>
   <div class="panel">
+    <h2>Capture hunt</h2>
+    <div class="hint">Uses the <b>Target AP</b> selected above. Sends a limited
+    deauth burst, watches the capture table, and stops as soon as a complete
+    4-way handshake or PMKID is saved (20 s maximum). PMF targets may ignore
+    the deauth and time out.</div>
+    <label style="margin-top:12px">Client (optional)</label>
+    <select id="huntSta"><option value="">any observed client</option></select>
+    <div class="row" style="margin-top:12px">
+      <button class="act danger" id="bHunt">Capture hunt</button>
+      <button class="act" id="bHuntStop">Stop hunt</button>
+    </div>
+    <div id="huntState" class="sub">idle</div>
+  </div>
+  <div class="panel">
     <h2>Hunting</h2>
     <div class="row">
       <div><label>Strategy</label><select id="strategy">
@@ -311,7 +325,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==='nets')loadNets();
   if(b.dataset.tab==='clients')loadClients();
   if(b.dataset.tab==='caps')loadCaps();
-  if(b.dataset.tab==='attack'){loadNets(true);$('#strategy').value=String(S.action_override??-1);}
+  if(b.dataset.tab==='attack'){loadNets(true).then(loadHuntClients);$('#strategy').value=String(S.action_override??-1);}
 });
 function renderStatus(){
   $('#dot').className='dot '+(S.connected?'on':(S.connecting?'warn':''));
@@ -332,6 +346,18 @@ function renderStatus(){
     ?'<span class="tag good">UNLOCKED</span> active features are available for this session.'
     :'<span class="tag bad">LOCKED</span> enter the authorization phrase to enable active attacks.';
   if($('#deauthState'))$('#deauthState').textContent=S.deauth_active?'burst active':'idle';
+  if($('#huntState')){
+    if(S.hunt_active){
+      $('#huntState').textContent='hunt active: '+Math.round((S.hunt_elapsed_ms||0)/1000)+'s / '+
+        Math.round((S.hunt_duration_ms||0)/1000)+'s'+(S.hunt_bssid?' · '+S.hunt_bssid:'');
+    }else{
+      const r=S.hunt_result||'idle';
+      $('#huntState').textContent='idle'+(r!=='idle'?(' · last: '+r+
+        (S.hunt_bssid?' · '+S.hunt_bssid:'')+(S.hunt_file?' · '+S.hunt_file:'')+
+        (S.hunt_message?' · '+S.hunt_message:'')):'');
+    }
+    if($('#bHunt'))$('#bHunt').textContent=S.hunt_active?'Hunt running...':'Capture hunt';
+  }
   $('#autoDeauth').checked=!!S.auto_deauth;
   if(S.auto_deauth!==undefined && S.auto_deauth && !S.authorized){$('#autoDeauth').checked=false}
   $('#wifiState').innerHTML = S.connected
@@ -380,6 +406,21 @@ async function loadClients(){
       (c.has_ap?'<button class="act danger" onclick="deauthClient(\''+c.bssid+'\',\''+c.mac+'\')">Deauth</button>':
        '<span class="sub">AP unknown</span>'))+'</td></tr>'});
   $('#cliRows').innerHTML=h;
+}
+async function loadHuntClients(){
+  const b=$('#targetAp').value;
+  const cur=$('#huntSta').value;
+  let h='<option value="">any observed client</option>';
+  if(b){
+    try{
+      const j=await api('/api/clients');
+      (j.clients||[]).filter(c=>c.bssid===b&&!c.self).forEach(c=>{
+        h+='<option value="'+c.mac+'">'+c.mac+' &middot; '+c.rssi+' dBm</option>';
+      });
+    }catch(e){}
+  }
+  $('#huntSta').innerHTML=h;
+  if([...$('#huntSta').options].some(o=>o.value===cur))$('#huntSta').value=cur;
 }
 async function deletePcap(name){if(!confirm('Delete '+name+'?'))return;try{await post('/api/pcap_delete',{name:name});toast('deleted');loadCaps();}catch(e){}}
 async function loadCaps(){
@@ -453,6 +494,24 @@ $('#bRevoke').onclick=async()=>{await post('/api/auth',{off:true});toast('attack
 $('#bDeauthAll').onclick=()=>{const b=$('#targetAp').value;if(!b)return toast('pick an AP',true);deauthAp(b,true)};
 $('#bDeauthBcast').onclick=()=>{const b=$('#targetAp').value;if(!b)return toast('pick an AP',true);deauthAp(b,false)};
 $('#bDeauthStop').onclick=async()=>{await post('/api/deauth',{stop:true});toast('deauth stopped');poll()};
+$('#targetAp').onchange=loadHuntClients;
+$('#bHunt').onclick=async()=>{
+  if(!S.authorized){toast('unlock attacks first',true);goUnlock();return}
+  const b=$('#targetAp').value;if(!b)return toast('pick an AP',true);
+  const sta=$('#huntSta').value||null;
+  if(!confirm('Start a capture hunt against '+b+(sta?(' / '+sta):'')+'?\n'+
+    'This sends a limited deauth burst for up to 20 seconds and stops when a complete\n'+
+    '4-way handshake or PMKID is saved. Only do this on networks you own.'))return;
+  const body={bssid:b,duration_ms:20000};if(sta)body.sta=sta;
+  try{const j=await post('/api/hunt',body);
+    if(j.started){
+      toast('hunt '+(j.duration_ms/1000)+'s: '+b+(sta?(' / '+sta):''),false);
+      if(j.warning)setTimeout(()=>toast(j.warning,true),2700);
+      poll();
+    }else toast(j.error||'hunt not started',true);
+  }catch(e){}
+};
+$('#bHuntStop').onclick=async()=>{await post('/api/hunt',{stop:true});toast('hunt stopped');poll()};
 $('#bHop').onclick=()=>{const b=$('#targetAp').value;if(!b)return toast('pick an AP',true);
   post('/api/hop_ap',{bssid:b}).then(j=>toast('channel '+j.channel)).catch(()=>{})};
 $('#bSetStrategy').onclick=async()=>{await post('/api/strategy',{action:+$('#strategy').value});toast('strategy set');poll()};

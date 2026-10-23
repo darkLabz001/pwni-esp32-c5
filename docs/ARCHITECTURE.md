@@ -64,6 +64,14 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - The live slot table is RAM-only and resets on reboot. `capture_list_files()` scans the directory for the web **Caps → Saved PCAPs** table, so files on the card remain visible and downloadable across reboots.
 - The SD card is mounted at 10 MHz on SPI2. `capture_bus_lock()` / `capture_bus_unlock()` serialize SD I/O with LVGL panel flushes. Large snapshot arrays use PSRAM to keep internal RAM for the CLI/HTTP/LVGL tasks.
 
+### `pwn_hunt` — deauth-assisted capture
+
+- A background `pwn_hunt` task owns one hunt at a time. `pwn_hunt_start()` validates the target, requires runtime authorization, rejects the device's own MAC, requires the AP to be in the scan table, and parks the radio on the target channel when the STA is disconnected.
+- The task starts through the existing `pwn_wifi_deauth_start()` worker with a 400 ms round interval and a duration equal to the hunt timeout (default 20 s, max 60 s). If a usable capture already exists it exits before transmitting anything.
+- Every 200 ms it calls `capture_find_usable()` (a lock-protected scan of the handshake slots, preferring SD-saved matches). It stops the deauth as soon as a complete 4-way handshake or PMKID is saved, or when the duration expires. A capture that is present but unsaved is accepted after a short grace period when no SD card is mounted.
+- The self-AP guard is reused: for the AP the STA is associated with, a station-specific hunt is allowed but an AP-wide hunt targets observed clients only and never falls back to broadcast. PMF targets are allowed with a warning.
+- Status (`hunt_active`, `hunt_result`, target, elapsed, file) is exposed through `/api/status`; `/api/hunt` starts or stops a hunt.
+
 ### `pwn_net` — station manager
 
 - NVS namespace `pwnnet` stores SSID/password and the autoconnect flag.
@@ -75,12 +83,12 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 
 ### `pwn_web` — dashboard and JSON API
 
-- `esp_http_server` on port 80; 21 registered handlers; 4 open sockets; LRU purge enabled.
-- The root page is embedded from `pwn_web_page.h` (about 23 KB) and uses a dark dashboard with tabs: Dash, Nets, Clients, Caps, Attack, Set.
+- `esp_http_server` on port 80; 27 registered handlers; 4 open sockets; LRU purge enabled.
+- The root page is embedded from `pwn_web_page.h` (about 31 KB) and uses a dark dashboard with tabs: Dash, Nets, Clients, Caps, Attack, Set.
 - Read APIs snapshot the pet/wifi/capture tables into `cJSON` documents. `/api/hs` also scans `/sdcard/handshakes` for saved PCAPs, so the dashboard's archive survives reboots.
-- Control APIs call `pwn_net`, `pwn_wifi`, `pwn_pet`, and `bsp_display_brightness_set`.
+- Control APIs call `pwn_net`, `pwn_wifi`, `pwn_hunt`, `pwn_pet`, and `bsp_display_brightness_set`.
 - PCAP download validates the requested basename with `safe_name()`, opens the file under the SD bus lock, and streams it with `Content-Disposition: attachment`.
-- Active-attack endpoints check `pwn_wifi_authorized()` and return `403` while locked. Channel-changing endpoints return `409 Conflict` while associated.
+- Active-attack endpoints check `pwn_wifi_authorized()` and return `403` while locked. `/api/hunt` starts/stops the capture hunt and `/api/status` reports its state. Channel-changing endpoints return `409 Conflict` while associated.
 - Authorization is case-insensitive: `/api/auth` with `{"phrase":"ADMIN"}` (or any case variant) unlocks; `{"off":true}` locks.
 
 ### `pwn_pet` — behavior
@@ -95,9 +103,9 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - 320×480 portrait, dark theme, green accent, Montserrat for body text and UNSCII for the pixel-font stats/face-adjacent details.
 - Four screens: FACE, SCAN, LOOT, SET, with a persistent bottom navigation. `ui_show_tab()` switches screens.
 - FACE: large animated eyes with pupils, a mouth arc, blink, idle eye darts, mood, status, `CH/AP/HS` and `PWN/PMK/CLI` stats, bond/level/XP, last event. Tapping the face calls `pet_touch()`.
-- SCAN: AP rows built from a snapshot; RSSI bars; tap opens a modal with BSSID/channel/security/RSSI/WPS and CONNECT / DEAUTH / CLOSE actions. Secured connections open the password keyboard.
+- SCAN: AP rows built from a snapshot; RSSI bars; tap opens a modal with BSSID/channel/security/RSSI/WPS and CONNECT / DEAUTH / CLIENTS / HUNT / CLOSE actions. Secured connections open the password keyboard. HUNT starts a 20-second deauth-assisted capture for the selected AP.
 - LOOT: capture rows with `PMKID` / `4WAY` / `SAVED` tags; tapping shows the PCAP file name.
-- SET: scrollable panels for WIFI CONNECTION, WEB DASHBOARD, ACTIVE ATTACKS, DISPLAY, and SYSTEM. The WiFi panel opens the SCAN tab; the active-attacks panel exposes UNLOCK/LOCK, auto-deauth, and the strategy dropdown; DISPLAY drives the backlight slider; SYSTEM shows firmware/heap/SD/network info plus RESET BRAIN and REBOOT.
+- SET: scrollable panels for WIFI CONNECTION, WEB DASHBOARD, ACTIVE ATTACKS, DISPLAY, and SYSTEM. The WiFi panel opens the SCAN tab; the active-attacks panel exposes UNLOCK/LOCK, auto-deauth, the strategy dropdown, and the hunt state; DISPLAY drives the backlight slider; SYSTEM shows firmware/heap/SD/network info plus RESET BRAIN and REBOOT.
 - Keyboard modals use the LVGL keyboard. Password entry is masked; the authorization phrase is visible and starts in uppercase mode. Phrase matching is case-insensitive.
 - A single `lv_timer` (200 ms) reads `pet_snapshot()` and `pwn_wifi_stats()` and updates labels, face geometry, and the scan/loot lists. Labels that must stay on one line get an explicit line-height; intentional multi-line labels use `label_lines()`.
 - Touch is polled through the BSP input device. The FT6336 gesture mode is disabled; the panel uses raw 320×480 coordinates with no swap/mirror.
