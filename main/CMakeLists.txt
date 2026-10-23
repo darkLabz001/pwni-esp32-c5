@@ -1,0 +1,26 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "pwn_brain.c"
+        "pwn_capture.c"
+        "pwn_wifi.c"
+        "pwn_net.c"
+        "pwn_web.c"
+        "pwn_pet.c"
+        "pwn_ui.c"
+        "pwn_cli.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        waveshare__esp32_c5_touch_lcd_3_5
+        nvs_flash
+        esp_netif
+        esp_wifi
+        esp_event
+        esp_timer
+        esp_driver_usb_serial_jtag
+        esp_http_server
+        app_update
+        json
+        lvgl
+        fatfs
+)

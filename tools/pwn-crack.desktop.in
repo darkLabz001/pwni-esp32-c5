@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PWNI PCAP Cracker
+Comment=Crack PCAPs from the PWNI ESP32-C5 when it appears on the network
+Exec=python3 @DIR@/pwn_crack.py --watch
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

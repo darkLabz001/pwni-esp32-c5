@@ -1,0 +1,10 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+.cache/
+__pycache__/
+*.pyc
+.DS_Store
+tools/wordlists/rockyou.txt
+tools/wordlists/SecLists/
