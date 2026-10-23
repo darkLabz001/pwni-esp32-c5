@@ -144,8 +144,24 @@ static const char *psram_mode(void)
 
 /* ---- page ------------------------------------------------------------- */
 
+static bool web_auth(httpd_req_t *req)
+{
+    char hdr[128];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK ||
+        strcmp(hdr, "Basic YWRtaW46QURNSU4=") != 0) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"PWNI\"");
+        httpd_resp_sendstr(req, "authentication required\n");
+        return false;
+    }
+    return true;
+}
+
 static esp_err_t page_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "max-age=60");
     return httpd_resp_send(req, PWN_WEB_PAGE, sizeof(PWN_WEB_PAGE) - 1);
@@ -153,6 +169,9 @@ static esp_err_t page_get(httpd_req_t *req)
 
 static esp_err_t favicon_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
 }
@@ -161,6 +180,9 @@ static esp_err_t favicon_get(httpd_req_t *req)
 
 static esp_err_t status_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     pwn_pet_t pet;
     pet_snapshot(&pet);
     const pwn_wifi_stats_t *st = pwn_wifi_stats();
@@ -249,6 +271,9 @@ static esp_err_t status_get(httpd_req_t *req)
 
 static esp_err_t aps_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     pwn_ap_t *aps = big_calloc(PWN_MAX_APS, sizeof(pwn_ap_t));
     if (!aps) {
         return fail(req, "500 Internal Server Error", "out of memory");
@@ -292,6 +317,9 @@ static esp_err_t aps_get(httpd_req_t *req)
 
 static esp_err_t clients_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     pwn_client_t *c = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
     if (!c) {
         return fail(req, "500 Internal Server Error", "out of memory");
@@ -324,6 +352,9 @@ static esp_err_t clients_get(httpd_req_t *req)
 
 static esp_err_t hs_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     pwn_handshake_t *hs = big_calloc(PWN_MAX_HS, sizeof(pwn_handshake_t));
     if (!hs) {
         return fail(req, "500 Internal Server Error", "out of memory");
@@ -368,6 +399,9 @@ static esp_err_t hs_get(httpd_req_t *req)
 
 static esp_err_t scan_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     int found = pwn_wifi_scan_now();
     cJSON *r = cJSON_CreateObject();
     if (found < 0) {
@@ -381,6 +415,9 @@ static esp_err_t scan_post(httpd_req_t *req)
 
 static esp_err_t connect_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -410,6 +447,9 @@ static esp_err_t connect_post(httpd_req_t *req)
 
 static esp_err_t disconnect_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     bool forget = body && cJSON_IsTrue(cJSON_GetObjectItem(body, "forget"));
@@ -440,6 +480,9 @@ static bool phrase_matches(const char *phrase)
 
 static esp_err_t sd_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -475,6 +518,9 @@ static esp_err_t sd_post(httpd_req_t *req)
 
 static esp_err_t auth_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -502,6 +548,9 @@ static esp_err_t auth_post(httpd_req_t *req)
 
 static esp_err_t attacks_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -521,6 +570,9 @@ static esp_err_t attacks_post(httpd_req_t *req)
 
 static esp_err_t deauth_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -779,6 +831,9 @@ static esp_err_t deauth_post(httpd_req_t *req)
 
 static esp_err_t hop_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -808,6 +863,9 @@ static esp_err_t hop_post(httpd_req_t *req)
 
 static esp_err_t hop_ap_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -852,6 +910,9 @@ static esp_err_t hop_ap_post(httpd_req_t *req)
 
 static esp_err_t pause_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     bool paused = body && cJSON_IsTrue(cJSON_GetObjectItem(body, "paused"));
@@ -866,6 +927,9 @@ static esp_err_t pause_post(httpd_req_t *req)
 
 static esp_err_t strategy_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -882,6 +946,9 @@ static esp_err_t strategy_post(httpd_req_t *req)
 
 static esp_err_t brightness_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -900,6 +967,9 @@ static esp_err_t brightness_post(httpd_req_t *req)
 
 static esp_err_t autoconnect_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char buf[BODY_MAX];
     cJSON *body = read_body(req, buf, sizeof(buf));
     if (!body) {
@@ -915,6 +985,9 @@ static esp_err_t autoconnect_post(httpd_req_t *req)
 
 static esp_err_t reset_brain_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     pet_reset_brain();
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "ok", true);
@@ -923,6 +996,9 @@ static esp_err_t reset_brain_post(httpd_req_t *req)
 
 static esp_err_t reboot_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "ok", true);
     send_json(req, r);
@@ -950,6 +1026,9 @@ static bool safe_name(const char *s)
 
 static esp_err_t pcap_get(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     char q[128];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) {
         return fail(req, "400 Bad Request", "missing file");
@@ -1098,6 +1177,9 @@ esp_err_t web_ota_github_start(void)
 
 static esp_err_t ota_github_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     if (!pwn_wifi_authorized()) {
         return fail(req, "403 Forbidden", "unlock attacks first");
     }
@@ -1117,6 +1199,9 @@ static esp_err_t ota_github_post(httpd_req_t *req)
 
 static esp_err_t ota_post(httpd_req_t *req)
 {
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
     if (!pwn_wifi_authorized()) {
         return fail(req, "403 Forbidden", "unlock attacks first");
     }

@@ -58,4 +58,4 @@
 #define PWN_FACE_COLOR_HEX 0x8CF58C
 
 /* Manual GitHub OTA (only runs when requested from Settings; never automatic). */
-#define PWN_OTA_URL "https://raw.githubusercontent.com/darkLabz001/pwni-esp32-c5/master/dist/esp32touch.bin"
+#define PWN_OTA_URL "https://raw.githubusercontent.com/darkLabz001/pwni-esp32-c5/ota/dist/esp32touch.bin"

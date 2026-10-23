@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -47,6 +48,7 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pwn
 COMMON_WORDLIST = ROOT / "wordlists" / "common.txt"
 KNOWN_IPS: list[str] = []
 USB_HINTS = ["/dev/ttyACM0", "/dev/ttyACM1"]
+AUTH_HEADER = "Basic " + base64.b64encode(b"admin:ADMIN").decode()
 
 SECLIST_FILES = (
     "Passwords/Leaked-Databases/rockyou.txt",
@@ -120,7 +122,7 @@ def _save_config(cfg: dict) -> None:
 
 def api_json(ip: str, path: str, timeout: float = 2.0) -> dict:
     url = f"http://{ip}{path}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0", "Authorization": AUTH_HEADER})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = r.read()
     return json.loads(data.decode("utf-8", "replace"))
@@ -204,7 +206,7 @@ def download_pcap(ip: str, name: str) -> Path:
     safe = Path(name).name
     dest = CACHE / safe
     url = f"http://{ip}/api/pcap?name={urllib.parse.quote(name, safe='')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pwni-crack/1.0", "Authorization": AUTH_HEADER})
     with urllib.request.urlopen(req, timeout=15) as r:
         data = r.read()
     if not data:

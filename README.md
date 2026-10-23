@@ -216,6 +216,10 @@ docs/                   # Hardware, architecture, legal notes
 - **The web dashboard drops during deauth** — you targeted the machine running the browser (or its AP with broadcast). The firmware skips its own STA, but it cannot protect your laptop/phone. Use a second device to watch, or reconnect after the burst.
 
 
+## Dashboard login
+
+The web dashboard uses HTTP Basic auth: user `admin`, password `ADMIN` (the same runtime phrase). It is a LAN speed bump, not TLS; do not expose the device directly to the internet.
+
 ## Releases and OTA
 
 Prebuilt firmware and the host tool are published at:
