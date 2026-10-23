@@ -726,6 +726,32 @@ def cmd_crack(pcap: str, bssid: str, essid: str, wordlist: str) -> int:
     return 1
 
 
+
+def cmd_crack_dir(directory: str, bssid: str, essid: str, wordlist: str) -> int:
+    d = Path(directory).expanduser()
+    files = sorted(d.glob("*.pcap")) + sorted(d.glob("*.pcapng"))
+    if not files:
+        print(f"no PCAPs in {d}", file=sys.stderr)
+        return 2
+    found_any = 0
+    for pcap in files:
+        b = bssid or file_bssid(pcap.name)
+        e = essid or file_ssid(pcap.name)
+        print(f"\n=== {pcap.name}  bssid={b or '?'}  essid={e or '?'} ===")
+        try:
+            found, key, _ = aircrack(pcap, b, Path(wordlist), e,
+                                     on_line=lambda line: None)
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
+            continue
+        if found:
+            print(f"  KEY FOUND: {key}")
+            found_any += 1
+        else:
+            print("  no key")
+    print(f"\n{found_any}/{len(files)} captures cracked")
+    return 0 if found_any else 1
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -737,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--list", action="store_true", help="print device handshakes and exit")
     ap.add_argument("--wordlists", action="store_true", help="print discovered wordlists and exit")
     ap.add_argument("--crack", metavar="PCAP", help="crack a local PCAP and exit")
+    ap.add_argument("--crack-dir", metavar="DIR", help="crack every PCAP in a directory and exit")
     ap.add_argument("--bssid", default="", help="BSSID for --crack")
     ap.add_argument("--essid", default="", help="ESSID for --crack (PCAPs from the device have no beacons)")
     ap.add_argument("--wordlist", default=None,
@@ -752,6 +779,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.crack:
         wordlist = args.wordlist or str(default_wordlist())
         return cmd_crack(args.crack, args.bssid, args.essid, wordlist)
+    if args.crack_dir:
+        wordlist = args.wordlist or str(default_wordlist())
+        return cmd_crack_dir(args.crack_dir, args.bssid, args.essid, wordlist)
 
     if tk is None:
         print("tkinter is not available; use --list or --crack", file=sys.stderr)

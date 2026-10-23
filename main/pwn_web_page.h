@@ -265,6 +265,7 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
       <button class="act danger" id="bReboot">Reboot device</button>
       <button class="act danger" id="bForget">Forget WiFi</button>
       <button class="act" id="bSdRemount">Remount SD</button>
+      <button class="act" id="bSdPrune">Prune SD</button>
     </div>
     <div class="row" style="margin-top:12px">
       <input id="otaFile" type="file" accept=".bin">
@@ -487,6 +488,10 @@ $('#bOta').onclick=async()=>{const f=$('#otaFile').files[0];
     if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
     toast('firmware written; rebooting...');
   }catch(e){toast(e.message,true)}};
+$('#bSdPrune').onclick=async()=>{
+  const n=prompt('Keep how many newest PCAPs?','50');if(n===null)return;
+  const k=parseInt(n,10);if(!(k>=0))return toast('invalid count',true);
+  toast('pruning...');try{const j=await post('/api/sd',{prune:k});toast('pruned '+j.pruned+' file(s)');poll();}catch(e){}};
 $('#bSdRemount').onclick=async()=>{toast('remounting SD...');
   try{const j=await post('/api/sd',{remount:true});
     toast(j.sd?('SD ready, '+fmtB(j.free)+' free'):'SD remount failed',!j.sd);poll();
