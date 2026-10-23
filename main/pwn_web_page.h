@@ -381,6 +381,7 @@ async function loadClients(){
        '<span class="sub">AP unknown</span>'))+'</td></tr>'});
   $('#cliRows').innerHTML=h;
 }
+async function deletePcap(name){if(!confirm('Delete '+name+'?'))return;try{await post('/api/pcap_delete',{name:name});toast('deleted');loadCaps();}catch(e){}}
 async function loadCaps(){
   const j=await api('/api/hs');let h='';
   if(!j.hs.length)h='<tr><td colspan="6" class="sub">no handshakes captured yet</td></tr>';
@@ -397,7 +398,7 @@ async function loadCaps(){
   let f='';
   if(!j.files||!j.files.length)f='<tr><td colspan="3" class="sub">no saved PCAPs on SD</td></tr>';
   (j.files||[]).forEach(x=>{f+='<tr><td class="mono">'+esc(x.name)+'</td><td>'+fmtB(x.size)+
-    '</td><td><a class="act" href="/api/pcap?name='+encodeURIComponent(x.name)+'">Download</a></td></tr>'});
+    '</td><td><a class="act" href="/api/pcap?name='+encodeURIComponent(x.name)+'">Download</a> <button class="act danger" onclick="deletePcap(\''+x.name.replace(/'/g,"\\'")+'\')">Delete</button></td></tr>'});
   $('#fileRows').innerHTML=f;
 }
 async function connectAp(ssid){

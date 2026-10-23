@@ -1024,6 +1024,35 @@ static bool safe_name(const char *s)
     return strstr(s, "..") == NULL;
 }
 
+
+static esp_err_t pcap_delete_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char buf[BODY_MAX];
+    cJSON *body = read_body(req, buf, sizeof(buf));
+    if (!body) {
+        return fail(req, "400 Bad Request", "invalid JSON");
+    }
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(body, "name"));
+    if (!name || !name[0] || strstr(name, "..") || strchr(name, '/') || strchr(name, '\\')) {
+        cJSON_Delete(body);
+        return fail(req, "400 Bad Request", "invalid filename");
+    }
+    char path[160];
+    snprintf(path, sizeof(path), PWN_HS_DIR "/%s", name);
+    int rc = unlink(path);
+    cJSON_Delete(body);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", rc == 0);
+    if (rc != 0) {
+        cJSON_AddStringToObject(r, "error", "delete failed");
+        httpd_resp_set_status(req, "404 Not Found");
+    }
+    return send_json(req, r);
+}
+
 static esp_err_t pcap_get(httpd_req_t *req)
 {
     if (!web_auth(req)) {
@@ -1281,6 +1310,7 @@ esp_err_t web_start(void)
         {.uri = "/api/hs",           .method = HTTP_GET,  .handler = hs_get},
         {.uri = "/api/sd",           .method = HTTP_POST, .handler = sd_post},
         {.uri = "/api/pcap",         .method = HTTP_GET,  .handler = pcap_get},
+        {.uri = "/api/pcap_delete",  .method = HTTP_POST, .handler = pcap_delete_post},
         {.uri = "/api/scan",         .method = HTTP_POST, .handler = scan_post},
         {.uri = "/api/connect",      .method = HTTP_POST, .handler = connect_post},
         {.uri = "/api/disconnect",   .method = HTTP_POST, .handler = disconnect_post},
