@@ -1286,6 +1286,11 @@ esp_err_t web_ota_github_start(void)
     return ESP_OK;
 }
 
+bool web_ota_busy(void)
+{
+    return s_github_ota_busy;
+}
+
 static esp_err_t ota_github_post(httpd_req_t *req)
 {
     if (!web_auth(req)) {

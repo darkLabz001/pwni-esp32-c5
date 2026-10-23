@@ -122,9 +122,18 @@ The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase
 | **FACE** | Animated eyes/mouth, blink and mood changes, XP/level/bond, channel/AP/HS stats, last event. Tap the face to pet it. |
 | **SCAN** | AP list with RSSI bars, channel, security, WPS, and handshake badges. Tap a row for details, connect, or (after unlocking) deauth. The scan button refreshes. |
 | **LOOT** | Captured handshakes from the current session, with BSSID and `PMKID` / `4WAY` / `SAVED` tags. Tap a row to show its file name. The web **Caps** tab also lists saved PCAPs from the SD card. |
-| **SET** | Wi-Fi connection and autoconnect, web dashboard URL, active-attack unlock/lock, auto-deauth, strategy override, display brightness, reset-brain, reboot. The settings page scrolls. |
+| **SET** | Wi-Fi connection and autoconnect, web dashboard URL with a scannable QR code, active-attack unlock/lock, auto-deauth, strategy override, display brightness and screen timeout, reset-brain, reboot. The settings page scrolls. |
 
 The bottom navigation is always available. The backlight can be dimmed from the settings slider.
+
+The panel dims to 15% after 45 seconds without a touch and blanks after 60
+seconds by default. The first tap restores the slider level and is swallowed so
+it cannot press an invisible control. **SET → DISPLAY → sleep** offers 30 s,
+60 s, 2 min, 5 min, or off; the choice is stored in NVS. The panel stays awake
+while a text-entry/modal dialog is open, during an active deauth burst, and
+during GitHub OTA. The dashboard QR is generated on-device from
+`http://<device-ip>/` and refreshes whenever the IP changes; offline it shows a
+`no link` placeholder.
 
 ## Serial CLI
 

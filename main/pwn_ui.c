@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp/esp-bsp.h"
@@ -72,8 +73,23 @@ static uint32_t s_loot_last;
 
 /* settings */
 static lv_obj_t *s_set_conn, *s_set_web, *s_set_auth, *s_set_sys, *s_set_deauth;
-static lv_obj_t *s_sw_auto, *s_sw_autoconn, *s_slider;
+static lv_obj_t *s_sw_auto, *s_sw_autoconn, *s_slider, *s_sleep_dd;
 static bool s_sw_busy;
+
+/* dashboard QR */
+static lv_obj_t *s_qr_box, *s_qr_offline;
+static lv_obj_t *s_qr;
+static char s_qr_url[32];
+
+/* backlight idle management */
+#define PWN_UI_NVS_NS       "pwnui"
+#define PWN_UI_NVS_SLEEP    "sleep_s"
+#define PWN_TIMEOUT_DEFAULT 60
+
+static uint16_t s_timeout_s = PWN_TIMEOUT_DEFAULT;
+static int s_user_brightness = 100;
+static bool s_dimmed, s_blanked;
+static lv_obj_t *s_wake_overlay;
 
 /* modal / keyboard */
 static lv_obj_t *s_modal;
@@ -95,6 +111,65 @@ static void close_btn_cb(lv_event_t *e);
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Screen-timeout choices, in seconds. Zero means "never sleep". */
+static const uint16_t k_timeouts[] = {30, 60, 120, 300, 0};
+static const char *k_timeout_options = "30 s\n60 s\n2 min\n5 min\noff";
+static const char *k_timeout_labels[] = {"30 s", "60 s", "2 min", "5 min", "off"};
+#define TIMEOUT_CHOICES ((int)(sizeof(k_timeouts) / sizeof(k_timeouts[0])))
+
+static int timeout_index(uint16_t seconds)
+{
+    for (int i = 0; i < TIMEOUT_CHOICES; i++) {
+        if (k_timeouts[i] == seconds) {
+            return i;
+        }
+    }
+    return 1;   /* 60 s */
+}
+
+static void timeout_load(void)
+{
+    nvs_handle_t h;
+    uint16_t v = PWN_TIMEOUT_DEFAULT;
+    if (nvs_open(PWN_UI_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u16(h, PWN_UI_NVS_SLEEP, &v) != ESP_OK) {
+            v = PWN_TIMEOUT_DEFAULT;
+        }
+        nvs_close(h);
+    }
+    if (timeout_index(v) == 1 && v != k_timeouts[1]) {
+        v = PWN_TIMEOUT_DEFAULT;
+    }
+    s_timeout_s = v;
+}
+
+static void timeout_save(uint16_t seconds)
+{
+    nvs_handle_t h;
+    if (nvs_open(PWN_UI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_u16(h, PWN_UI_NVS_SLEEP, seconds);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Restore the level chosen with the DISPLAY slider. The dim/blank state is
+ * deliberately separate so waking up never changes the user's preference. */
+static void screen_wake(void)
+{
+    if (!s_dimmed && !s_blanked) {
+        return;
+    }
+    s_dimmed = false;
+    s_blanked = false;
+    bsp_display_brightness_set(s_user_brightness);
+    if (s_wake_overlay) {
+        lv_obj_add_flag(s_wake_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_display_trigger_activity(NULL);
 }
 
 static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg)
@@ -974,7 +1049,31 @@ static void strat_cb(lv_event_t *e)
 static void slider_cb(lv_event_t *e)
 {
     int v = lv_slider_get_value(lv_event_get_target(e));
-    bsp_display_brightness_set(v);
+    s_user_brightness = v;
+    /* While dimmed/blanked this only updates the level restored on wake. */
+    if (!s_dimmed && !s_blanked) {
+        bsp_display_brightness_set(v);
+    }
+}
+
+static void sleep_cb(lv_event_t *e)
+{
+    int sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel < 0 || sel >= TIMEOUT_CHOICES) {
+        sel = 1;
+    }
+    s_timeout_s = k_timeouts[sel];
+    timeout_save(s_timeout_s);
+    if (s_timeout_s == 0) {
+        screen_wake();
+    }
+    toastf("screen sleep: %s", k_timeout_labels[sel]);
+}
+
+static void wake_overlay_cb(lv_event_t *e)
+{
+    (void)e;
+    screen_wake();
 }
 
 static void reboot_cb(lv_event_t *e)
@@ -1124,10 +1223,32 @@ static void build_settings(lv_obj_t *s)
     lv_obj_add_event_cb(s_sw_autoconn, sw_auto_conn_cb, LV_EVENT_VALUE_CHANGED, NULL);
     y += 166;
 
-    lv_obj_t *p2 = set_panel(list, y, 66, "WEB DASHBOARD");
-    s_set_web = label(p2, &lv_font_montserrat_12, C_ACC2, 12, 32, 280);
+    lv_obj_t *p2 = set_panel(list, y, 150, "WEB DASHBOARD");
+    s_set_web = label(p2, &lv_font_montserrat_12, C_ACC2, 12, 36, 164);
+    label_lines(s_set_web, 2);
     lv_label_set_text(s_set_web, "connect to WiFi first");
-    y += 76;
+    lv_obj_t *wh = label(p2, &lv_font_montserrat_12, C_DIM, 12, 90, 164);
+    lv_label_set_text(wh, "scan to open");
+
+    /* White quiet-zone box around the QR so it scans reliably on a dark UI. */
+    s_qr_box = box(p2, 184, 30, 108, 108, 0xffffff);
+    lv_obj_set_style_radius(s_qr_box, 4, 0);
+    lv_obj_set_style_border_width(s_qr_box, 0, 0);
+    s_qr = lv_qrcode_create(s_qr_box);
+    lv_qrcode_set_size(s_qr, 96);
+    lv_qrcode_set_dark_color(s_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_qr, lv_color_hex(0xffffff));
+    lv_obj_set_pos(s_qr, 6, 6);
+
+    s_qr_offline = box(p2, 184, 30, 108, 108, C_PANEL);
+    lv_obj_t *ol = lv_label_create(s_qr_offline);
+    lv_obj_set_style_text_font(ol, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ol, lv_color_hex(C_DIM), 0);
+    lv_obj_set_style_text_align(ol, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(ol, "no\nlink");
+    lv_obj_center(ol);
+    lv_obj_add_flag(s_qr_box, LV_OBJ_FLAG_HIDDEN);
+    y += 160;
 
     lv_obj_t *p3 = set_panel(list, y, 236, "ACTIVE ATTACKS");
     s_set_auth = label(p3, &lv_font_montserrat_12, C_WARN, 12, 30, 280);
@@ -1170,18 +1291,31 @@ static void build_settings(lv_obj_t *s)
     lv_label_set_text(ah, "Run deauths only on networks you own.");
     y += 246;
 
-    lv_obj_t *p4 = set_panel(list, y, 78, "DISPLAY");
+    lv_obj_t *p4 = set_panel(list, y, 118, "DISPLAY");
     lv_obj_t *bl = label(p4, &lv_font_montserrat_12, C_DIM, 12, 42, 60);
     lv_label_set_text(bl, "light");
     s_slider = lv_slider_create(p4);
     lv_obj_set_pos(s_slider, 54, 40);
     lv_obj_set_size(s_slider, 220, 16);
     lv_slider_set_range(s_slider, 10, 100);
-    lv_slider_set_value(s_slider, 100, LV_ANIM_OFF);
+    lv_slider_set_value(s_slider, s_user_brightness, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_slider, lv_color_hex(0x162016), 0);
     lv_obj_set_style_bg_color(s_slider, lv_color_hex(C_ACC), LV_PART_INDICATOR);
     lv_obj_add_event_cb(s_slider, slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    y += 88;
+
+    lv_obj_t *to = label(p4, &lv_font_montserrat_12, C_DIM, 12, 78, 60);
+    lv_label_set_text(to, "sleep");
+    s_sleep_dd = lv_dropdown_create(p4);
+    lv_obj_set_pos(s_sleep_dd, 54, 72);
+    lv_obj_set_size(s_sleep_dd, 220, 36);
+    lv_dropdown_set_options(s_sleep_dd, k_timeout_options);
+    lv_dropdown_set_selected(s_sleep_dd, timeout_index(s_timeout_s));
+    lv_obj_set_style_bg_color(s_sleep_dd, lv_color_hex(0x0a0f0b), 0);
+    lv_obj_set_style_text_color(s_sleep_dd, lv_color_hex(C_FG), 0);
+    lv_obj_set_style_border_color(s_sleep_dd, lv_color_hex(C_LINE), 0);
+    lv_obj_set_style_text_font(s_sleep_dd, &lv_font_montserrat_12, 0);
+    lv_obj_add_event_cb(s_sleep_dd, sleep_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    y += 128;
 
     lv_obj_t *p5 = set_panel(list, y, 176, "SYSTEM");
     s_set_sys = label(p5, &lv_font_unscii_8, C_DIM, 12, 28, 280);
@@ -1267,10 +1401,30 @@ static void ui_timer_cb(lv_timer_t *t)
             lv_obj_set_style_text_color(s_set_conn, lv_color_hex(C_DIM), 0);
         }
         if (s_set_web) {
-            if (net.connected) {
-                lv_label_set_text_fmt(s_set_web, "http://%s/", net.ip);
+            if (net.connected && net.ip[0]) {
+                char url[32];
+                snprintf(url, sizeof(url), "http://%s/", net.ip);
+                lv_label_set_text(s_set_web, url);
+                if (strcmp(url, s_qr_url) != 0) {
+                    if (lv_qrcode_update(s_qr, url, strlen(url)) == LV_RESULT_OK) {
+                        snprintf(s_qr_url, sizeof(s_qr_url), "%s", url);
+                        lv_obj_add_flag(s_qr_offline, LV_OBJ_FLAG_HIDDEN);
+                        lv_obj_clear_flag(s_qr_box, LV_OBJ_FLAG_HIDDEN);
+                    } else {
+                        /* Not expected for a short URL, but do not leave a
+                         * stale QR pointing at an old address. */
+                        s_qr_url[0] = 0;
+                        lv_obj_add_flag(s_qr_box, LV_OBJ_FLAG_HIDDEN);
+                        lv_obj_clear_flag(s_qr_offline, LV_OBJ_FLAG_HIDDEN);
+                    }
+                }
             } else {
-                lv_label_set_text(s_set_web, "connect to WiFi first");
+                lv_label_set_text(s_set_web, "connect to\nWiFi first");
+                if (s_qr_url[0]) {
+                    s_qr_url[0] = 0;
+                }
+                lv_obj_add_flag(s_qr_box, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(s_qr_offline, LV_OBJ_FLAG_HIDDEN);
             }
         }
         s_sw_busy = true;
@@ -1347,6 +1501,46 @@ static void ui_timer_cb(lv_timer_t *t)
         }
     }
 
+    /*
+     * Backlight idle management. LVGL tracks touch activity for us, so the
+     * same mechanism covers every tab and any widget. Dim at 75% of the
+     * timeout, blank at the timeout, and use the slider value on wake.
+     * Keep the panel awake while the user is in a modal, while a deauth burst
+     * is running, and during GitHub OTA so progress stays visible.
+     */
+    bool hold_awake = (s_modal != NULL) || web_ota_busy() ||
+                      pwn_wifi_deauth_active();
+    uint32_t idle = lv_display_get_inactive_time(NULL);
+    if (hold_awake) {
+        if (s_dimmed || s_blanked) {
+            screen_wake();
+        }
+        lv_display_trigger_activity(NULL);
+    } else if (s_timeout_s > 0) {
+        uint32_t blank_ms = (uint32_t)s_timeout_s * 1000u;
+        uint32_t dim_ms = (blank_ms * 3u) / 4u;
+        if (!s_blanked && idle >= blank_ms) {
+            s_blanked = true;
+            s_dimmed = true;
+            bsp_display_brightness_set(0);
+            if (s_wake_overlay) {
+                lv_obj_clear_flag(s_wake_overlay, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(s_wake_overlay);
+            }
+        } else if (!s_dimmed && idle >= dim_ms) {
+            int dim = (s_user_brightness * 15) / 100;
+            if (dim < 5) {
+                dim = 5;
+            }
+            s_dimmed = true;
+            bsp_display_brightness_set(dim);
+        } else if ((s_dimmed || s_blanked) && idle < 1000) {
+            /* Touch arrived without hitting the wake overlay (for example a
+             * modal was open when the screen dimmed). */
+            screen_wake();
+        }
+    }
+
     /* Toast timeout. */
     if (s_toast && s_toast_until && now > s_toast_until) {
         lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
@@ -1358,6 +1552,8 @@ static void ui_timer_cb(lv_timer_t *t)
 
 void ui_init(void)
 {
+    timeout_load();
+
     if (bsp_display_lock(1000) != ESP_OK) {
         ESP_LOGE(TAG, "could not lock display");
         return;
@@ -1432,6 +1628,17 @@ void ui_init(void)
     lv_obj_center(tl);
     s_toast_lbl = tl;
     lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+
+    /* Transparent wake-catcher above everything. It is only enabled while
+     * the backlight is blanked so the first tap cannot press a control that
+     * the user cannot see. */
+    s_wake_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_wake_overlay);
+    lv_obj_set_pos(s_wake_overlay, 0, 0);
+    lv_obj_set_size(s_wake_overlay, W, H);
+    lv_obj_add_flag(s_wake_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_wake_overlay, wake_overlay_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_flag(s_wake_overlay, LV_OBJ_FLAG_HIDDEN);
 
     s_last_mood = (pwn_mood_t)-1;
     s_blink = false;
