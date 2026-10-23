@@ -82,6 +82,8 @@ static lv_obj_t *s_ta;
 static char s_kb_ssid[33];
 static int s_kb_mode_kind;   /* 0 = connect, 1 = auth */
 static pwn_ap_t s_sel_ap;
+static pwn_client_t s_ui_clients[PWN_MAX_CLIENTS];
+static int s_ui_client_count;
 static lv_obj_t *s_toast, *s_toast_lbl;
 static uint32_t s_toast_until;
 
@@ -663,6 +665,89 @@ static void close_btn_cb(lv_event_t *e)
     close_modal();
 }
 
+
+static void client_deauth_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_ui_client_count) {
+        return;
+    }
+    pwn_client_t c = s_ui_clients[idx];
+    close_modal();
+    pwn_deauth_job_t job = {0};
+    memcpy(job.bssid, s_sel_ap.bssid, 6);
+    memcpy(job.sta, c.mac, 6);
+    job.have_sta = true;
+    job.duration_ms = 8000;
+    job.interval_ms = 50;
+    job.reason = 1;
+    if (pwn_wifi_deauth_start(&job) == ESP_OK) {
+        toastf("deauth 8s: %02x:%02x:%02x:%02x:%02x:%02x",
+               c.mac[0], c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5]);
+    } else {
+        toastf("deauth failed");
+    }
+}
+
+static void clients_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    close_modal();
+    uint8_t self[6];
+    pwn_wifi_self_mac(self);
+    pwn_client_t all[PWN_MAX_CLIENTS];
+    int n = pwn_wifi_client_snapshot(all, PWN_MAX_CLIENTS);
+    s_ui_client_count = 0;
+    for (int i = 0; i < n && s_ui_client_count < PWN_MAX_CLIENTS; i++) {
+        if (memcmp(all[i].bssid, s_sel_ap.bssid, 6) != 0) continue;
+        if (memcmp(all[i].mac, self, 6) == 0) continue;
+        s_ui_clients[s_ui_client_count++] = all[i];
+    }
+
+    s_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_modal);
+    lv_obj_set_size(s_modal, W, H);
+    lv_obj_set_style_bg_color(s_modal, lv_color_hex(0), 0);
+    lv_obj_set_style_bg_opa(s_modal, LV_OPA_70, 0);
+    lv_obj_add_flag(s_modal, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_modal, kb_overlay_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *p = box(s_modal, 12, 90, 296, 300, C_PANEL);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_t *t = label(p, &lv_font_montserrat_14, C_ACC, 12, 10, 270);
+    lv_label_set_text(t, "CLIENTS");
+    lv_obj_t *sub = label(p, &lv_font_montserrat_12, C_DIM, 12, 30, 270);
+    lv_label_set_text_fmt(sub, "%.32s", s_sel_ap.ssid[0] ? s_sel_ap.ssid : "<hidden>");
+
+    lv_obj_t *list = lv_obj_create(p);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_pos(list, 12, 52);
+    lv_obj_set_size(list, 272, 184);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_all(list, 0, 0);
+
+    if (s_ui_client_count == 0) {
+        lv_obj_t *none = label(list, &lv_font_montserrat_12, C_DIM, 4, 8, 260);
+        lv_label_set_text(none, "no clients seen");
+    } else {
+        for (int i = 0; i < s_ui_client_count; i++) {
+            char text[64];
+            snprintf(text, sizeof(text), "%02x:%02x:%02x:%02x:%02x:%02x  %d dBm",
+                     s_ui_clients[i].mac[0], s_ui_clients[i].mac[1],
+                     s_ui_clients[i].mac[2], s_ui_clients[i].mac[3],
+                     s_ui_clients[i].mac[4], s_ui_clients[i].mac[5],
+                     s_ui_clients[i].rssi);
+            lv_obj_t *b = text_btn(list, text, 0, i * 38, 260, 34, false);
+            lv_obj_add_event_cb(b, client_deauth_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)i);
+        }
+    }
+
+    lv_obj_t *close = text_btn(p, "CLOSE", 12, 248, 272, 34, false);
+    lv_obj_add_event_cb(close, close_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void ap_clicked(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -702,12 +787,14 @@ static void ap_clicked(lv_event_t *e)
     label_lines(i, 2);
     lv_label_set_text(i, info);
 
-    lv_obj_t *b1 = text_btn(p, "CONNECT", 12, 120, 128, 40, true);
+    lv_obj_t *b1 = text_btn(p, "CONNECT", 12, 120, 84, 40, true);
     lv_obj_add_event_cb(b1, ap_connect_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *b2 = text_btn(p, "DEAUTH", 148, 120, 136, 40, false);
+    lv_obj_t *b2 = text_btn(p, "DEAUTH", 100, 120, 84, 40, false);
     lv_obj_add_event_cb(b2, ap_deauth_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *b3 = text_btn(p, "CLOSE", 12, 166, 272, 32, false);
-    lv_obj_add_event_cb(b3, close_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *b3 = text_btn(p, "CLIENTS", 188, 120, 96, 40, false);
+    lv_obj_add_event_cb(b3, clients_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *b4 = text_btn(p, "CLOSE", 12, 166, 272, 32, false);
+    lv_obj_add_event_cb(b4, close_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void scan_btn_cb(lv_event_t *e)
