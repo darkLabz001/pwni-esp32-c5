@@ -1290,7 +1290,7 @@ esp_err_t web_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 32;
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;
