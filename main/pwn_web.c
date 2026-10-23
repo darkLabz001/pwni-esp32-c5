@@ -1816,7 +1816,7 @@ static esp_err_t ota_download_image(const char *url, const char *path,
             break;
         }
         written += (uint64_t)n;
-        int pct = (int)((written * 90) / (uint64_t)dl.total);
+        int pct = 5 + (int)((written * 85) / (uint64_t)dl.total);
         if (pct > 90) {
             pct = 90;
         }
@@ -2091,6 +2091,9 @@ static esp_err_t ota_post(httpd_req_t *req)
     }
     if (!pwn_wifi_authorized()) {
         return fail(req, "403 Forbidden", "unlock attacks first");
+    }
+    if (s_github_ota_busy) {
+        return fail(req, "409 Conflict", "OTA already running");
     }
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
