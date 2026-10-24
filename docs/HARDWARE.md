@@ -45,7 +45,7 @@ The vendored BSP in `components/waveshare__esp32_c5_touch_lcd_3_5/` is the autho
 ## Display
 
 - 320×480 portrait, RGB565, LVGL 9.
-- The display adapter allocates draw buffers in PSRAM. The build sets `CONFIG_BSP_LCD_BUFFER_HEIGHT=80`, `CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH=2`, and `CONFIG_BSP_LCD_SPI_CLOCK_HZ=60000000`.
+- The display adapter allocates draw buffers in PSRAM. The BSP sets `.buffer_height = 20`, `CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH=2`, and `CONFIG_BSP_LCD_SPI_CLOCK_HZ=60000000`. The 20-line buffer keeps each SPI DMA bounce allocation around 12.8 KiB, which leaves headroom for the NimBLE HID connection and its notification traffic in the internal DMA-capable heap. At 80 lines (and still at 40 lines under HID typing load) the LCD queue could fail to allocate its bounce buffer, and LVGL then waited forever for a flush completion. If you increase the height, verify that `heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)` stays above the per-transfer size.
 - Backlight is controlled through the IO expander/PWM. The settings slider writes 10–100% and the web API exposes `/api/brightness`.
 - The panel is used at `ESP_LV_ADAPTER_ROTATE_0`.
 

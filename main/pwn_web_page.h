@@ -336,6 +336,40 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
     </div>
     <div id="huntState" class="sub">idle</div>
   </div>
+  <div class="panel" style="border-color:#5a4718">
+    <h2>BLE HID keyboard (experimental)</h2>
+    <div class="hint" style="color:#ffd98a;border:1px solid #5a4718;background:#241d0a;
+      padding:10px;border-radius:8px;margin-bottom:12px">
+      <b>AUTHORIZED USE ONLY.</b> HID mode advertises this device as a BLE
+      keyboard and types a payload into whichever host connects. Use it only
+      on machines you own or have explicit written permission to test. It
+      pauses the passive BLE scanner while active, is never started
+      automatically, stops when the authorization is revoked, and times out
+      after 5 minutes with no host. No target data is stored.
+    </div>
+    <label>Payload from /sdcard/payloads (*.txt)</label>
+    <div class="row">
+      <select id="hidPayload"><option value="">no payloads on SD</option></select>
+      <button class="act fit" id="bHidRefresh" style="align-self:end">Refresh</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="hidFile" type="file" accept=".txt,text/plain">
+      <button class="act fit" id="bHidUpload" style="align-self:end">Upload .txt</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="act danger" id="bHidStart">Start HID mode</button>
+      <button class="act danger" id="bHidRun">Type payload</button>
+      <button class="act" id="bHidStop">Stop &amp; disconnect</button>
+    </div>
+    <div id="hidState" class="sub" style="margin-top:10px">HID off</div>
+    <div class="hint">Start HID mode, pair with <b>PWNI-KBD</b> on the host
+    (Just Works; no PIN), then choose a payload and press <b>Type payload</b>.
+    Text uses the US keyboard layout. Supported commands: plain text,
+    <code>STRING</code>, <code>DELAY ms</code>, <code>REM</code>,
+    <code>ENTER</code>, <code>TAB</code>, <code>ESC</code>, arrow/navigation
+    keys, and modifier combinations such as <code>CTRL ALT t</code> or
+    <code>GUI r</code>.</div>
+  </div>
   <div class="panel">
     <h2>Hunting</h2>
     <div class="row">
@@ -449,7 +483,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==='ble')loadBle();
   if(b.dataset.tab==='intel')loadIntel();
   if(b.dataset.tab==='caps')loadCaps();
-  if(b.dataset.tab==='attack'){loadNets(true).then(loadHuntClients);$('#strategy').value=String(S.action_override??-1);}
+  if(b.dataset.tab==='attack'){loadNets(true).then(loadHuntClients);$('#strategy').value=String(S.action_override??-1);loadHid();}
 });
 $('#watchBadge').onclick=()=>document.querySelector('nav button[data-tab="clients"]').click();
 function renderWatchBadge(){
@@ -617,6 +651,40 @@ async function loadBle(){
     '</td><td class="sub">'+ago(d.last_seen_ms)+'</td></tr>'});
   $('#bleRows').innerHTML=h;
 }
+async function loadHid(){
+  let j;try{j=await api('/api/hid')}catch(e){return}
+  const cur=$('#hidPayload').value;
+  let h='';
+  if(!j.payloads||!j.payloads.length){
+    h='<option value="">no payloads on SD</option>';
+  }else{
+    j.payloads.forEach(p=>{h+='<option value="'+esc(p.name)+'">'+esc(p.name)+
+      ' ('+fmtB(p.size)+')</option>'});
+  }
+  $('#hidPayload').innerHTML=h;
+  const want=j.hid_payload||cur;
+  if([...$('#hidPayload').options].some(o=>o.value===want))$('#hidPayload').value=want;
+
+  const on=!!j.hid_active,ex=!!j.hid_executing;
+  $('#bHidStart').disabled=!j.hid_supported||on;
+  $('#bHidRun').disabled=!on||!j.hid_connected||!j.hid_subscribed||ex;
+  $('#bHidStop').disabled=!on&&!ex;
+  let t;
+  if(!j.hid_supported)t='BLE HID is not available in this build.';
+  else if(ex)t='typing '+esc(j.hid_payload||'(payload)')+' · line '+(j.hid_line||0)+
+    '/'+(j.hid_lines||0)+' · '+(j.hid_chars||0)+' chars';
+  else if(j.hid_state==='advertising')t='advertising as PWNI-KBD · waiting for a host · '+
+    Math.round((j.hid_age_ms||0)/1000)+'s · BLE scanner paused';
+  else if(j.hid_connected)t='host connected'+(j.hid_encrypted?' (encrypted)':' (not encrypted)')+
+    (j.hid_subscribed?' · keyboard reports subscribed':' · waiting for subscription')+
+    ' · use Type payload when ready';
+  else if(j.hid_state==='done')t='idle after completing '+(j.hid_payload||'payload')+
+    ' · '+(j.hid_chars||0)+' chars · host still connected';
+  else if(j.hid_state==='error')t='HID error';
+  else t='HID off · payloads never run automatically';
+  if(j.hid_error)t+=' · '+esc(j.hid_error);
+  $('#hidState').textContent=t;
+}
 async function loadIntel(){
   const j=await api('/api/network');
   const c=j.counts||{};
@@ -721,6 +789,51 @@ $('#bleOn').onchange=async e=>{
     toast('BLE scanner '+(j.enabled?'enabled':'disabled'));loadBle();poll();
   }catch(x){e.target.checked=!e.target.checked}
 };
+$('#bHidRefresh').onclick=loadHid;
+$('#bHidUpload').onclick=async()=>{
+  if(!S.authorized){toast('unlock attacks first',true);goUnlock();return}
+  const f=$('#hidFile').files[0];
+  if(!f)return toast('choose a .txt payload',true);
+  if(!/\.txt$/i.test(f.name))return toast('only .txt payloads are accepted',true);
+  if(f.size>16384)return toast('payload exceeds 16 KiB',true);
+  try{
+    const txt=await f.text();
+    const r=await fetch('/api/hid_payload?name='+encodeURIComponent(f.name),
+      {method:'POST',headers:{'Content-Type':'text/plain'},body:txt});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    toast('uploaded '+j.name+' ('+fmtB(j.size)+')');
+    $('#hidFile').value='';loadHid();poll();
+  }catch(e){toast(e.message,true)}
+};
+$('#bHidStart').onclick=async()=>{
+  if(!S.authorized){toast('unlock attacks first',true);goUnlock();return}
+  const p=$('#hidPayload').value;
+  if(!p)return toast('put a .txt payload in /sdcard/payloads',true);
+  if(!confirm('Enable BLE HID keyboard mode?\n\n'+
+    'This advertises the device as a keyboard, pauses the passive BLE scanner,\n'+
+    'and waits for a host to pair. It never types anything until you press\n'+
+    'Type payload. Only use it on a machine you own or are authorized to test.'))return;
+  try{const j=await post('/api/hid',{action:'start',payload:p});
+    toast('HID advertising as PWNI-KBD');loadHid();poll();
+  }catch(e){}
+};
+$('#bHidRun').onclick=async()=>{
+  if(!S.authorized){toast('unlock attacks first',true);goUnlock();return}
+  const p=$('#hidPayload').value;
+  if(!p)return toast('select a payload',true);
+  if(!confirm('Type "'+p+'" into the connected host now?\n\n'+
+    'Make sure the right window has focus. Only do this on a host you own\n'+
+    'or have written permission to test.'))return;
+  try{const j=await post('/api/hid',{action:'run',payload:p});
+    toast('typing '+p);loadHid();
+  }catch(e){}
+};
+$('#bHidStop').onclick=async()=>{
+  if(!confirm('Stop HID mode, release keys, and disconnect the host?'))return;
+  try{await post('/api/hid',{action:'stop'});toast('HID stopped; scanner restored');
+    loadHid();poll();}catch(e){}
+};
 $('#bScan').onclick=$('#bScan2').onclick=async()=>{toast('scanning...');
   try{const j=await post('/api/scan',{});toast('found '+j.found+' APs');loadNets()}catch(e){}};
 $('#bAuthState').onclick=async()=>{goUnlock()};
@@ -811,6 +924,7 @@ setInterval(()=>{if(document.getElementById('nets').classList.contains('active')
 setInterval(()=>{if(document.getElementById('caps').classList.contains('active'))loadCaps()},5000);
 setInterval(()=>{if(document.getElementById('clients').classList.contains('active'))loadClients()},5000);
 setInterval(()=>{if(document.getElementById('ble').classList.contains('active'))loadBle()},4000);
+setInterval(()=>{if(document.getElementById('attack').classList.contains('active'))loadHid()},2500);
 setInterval(()=>{if(document.getElementById('intel').classList.contains('active'))loadIntel()},5000);
 </script>
 </body>

@@ -547,7 +547,12 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .rotation = cfg->rotation,
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
-            .buffer_height = 80,
+            /* 20 lines keeps the SPI DMA bounce allocation (~12.8 KiB)
+             * well below the largest internal DMA-capable block left after
+             * a BLE HID connection. At 80/40 lines the LCD queue could fail
+             * under HID load and LVGL would wait forever for the flush
+             * completion callback. */
+            .buffer_height = 20,
             .use_psram = true,
             .enable_ppa_accel = false,
             .require_double_buffer = true,

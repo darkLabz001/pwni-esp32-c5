@@ -33,4 +33,10 @@ bool ble_gated(void);
 int  ble_device_count(void);
 int  ble_snapshot(pwn_ble_dev_t *out, int max);
 
+/* BLE HID mode owns the radio while it is active. Enabling this stops the
+ * passive scan immediately; disabling it lets the supervisor restart the
+ * scan if the user had requested it. */
+bool ble_hid_set_active(bool on);
+bool ble_hid_active(void);
+
 const char *ble_addr_type_name(uint8_t type);

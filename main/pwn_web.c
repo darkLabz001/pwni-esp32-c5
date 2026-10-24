@@ -34,6 +34,7 @@
 #include "pwn_web_page.h"
 #include "pwn_watch.h"
 #include "pwn_ble.h"
+#include "pwn_hid.h"
 #include "pwn_netmeta.h"
 #include "pwn_oui.h"
 
@@ -165,6 +166,27 @@ static const char *psram_mode(void)
 #endif
 }
 
+static void hid_status_fields(cJSON *r)
+{
+    pwn_hid_status_t hid;
+    hid_status(&hid);
+    cJSON_AddBoolToObject(r, "hid_supported", hid.supported);
+    cJSON_AddBoolToObject(r, "hid_active", hid.active);
+    cJSON_AddBoolToObject(r, "hid_authorized", hid.authorized);
+    cJSON_AddBoolToObject(r, "hid_connected", hid.connected);
+    cJSON_AddBoolToObject(r, "hid_encrypted", hid.encrypted);
+    cJSON_AddBoolToObject(r, "hid_subscribed", hid.subscribed);
+    cJSON_AddBoolToObject(r, "hid_boot_mode", hid.boot_mode);
+    cJSON_AddBoolToObject(r, "hid_executing", hid.executing);
+    cJSON_AddStringToObject(r, "hid_state", hid_state_name(hid.state));
+    cJSON_AddStringToObject(r, "hid_payload", hid.selected);
+    cJSON_AddStringToObject(r, "hid_error", hid.error);
+    cJSON_AddNumberToObject(r, "hid_line", hid.line);
+    cJSON_AddNumberToObject(r, "hid_lines", hid.lines);
+    cJSON_AddNumberToObject(r, "hid_chars", hid.chars);
+    cJSON_AddNumberToObject(r, "hid_age_ms", hid.age_ms);
+}
+
 /* ---- page ------------------------------------------------------------- */
 
 static bool web_auth(httpd_req_t *req)
@@ -262,6 +284,7 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "ble_scanning", ble_scanning());
     cJSON_AddBoolToObject(r, "ble_gated", ble_gated());
     cJSON_AddNumberToObject(r, "ble_count", ble_device_count());
+    hid_status_fields(r);
 
     int watch_count = 0;
     uint32_t watch_hits = 0;
@@ -588,6 +611,160 @@ static esp_err_t ble_post(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "gated", ble_gated());
     cJSON_AddStringToObject(r, "note",
         "passive scan only; no connections or writes");
+    return send_json(req, r);
+}
+
+static esp_err_t hid_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    pwn_hid_payload_t *p = big_calloc(PWN_HID_MAX_PAYLOADS, sizeof(*p));
+    if (!p) {
+        return fail(req, "500 Internal Server Error", "out of memory");
+    }
+    int n = hid_list_payloads(p, PWN_HID_MAX_PAYLOADS);
+
+    cJSON *root = cJSON_CreateObject();
+    hid_status_fields(root);
+    cJSON_AddStringToObject(root, "dir", PWN_HID_PAYLOAD_DIR);
+    cJSON_AddNumberToObject(root, "max_payloads", PWN_HID_MAX_PAYLOADS);
+    cJSON_AddStringToObject(root, "warning",
+        "Authorized use only. HID mode types into the connected host and "
+        "pauses the passive BLE scanner. Never run it against a device you "
+        "do not own or have written permission to test.");
+    cJSON *arr = cJSON_AddArrayToObject(root, "payloads");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name", p[i].name);
+        cJSON_AddNumberToObject(o, "size", p[i].size);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(p);
+    return send_json(req, root);
+}
+
+static esp_err_t hid_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char buf[BODY_MAX];
+    cJSON *body = read_body(req, buf, sizeof(buf));
+    if (!body) {
+        return fail(req, "400 Bad Request", "invalid JSON");
+    }
+    cJSON *act = cJSON_GetObjectItem(body, "action");
+    cJSON *pay = cJSON_GetObjectItem(body, "payload");
+    char action[16];
+    char payload[PWN_HID_PAYLOAD_NAME_MAX];
+    snprintf(action, sizeof(action), "%.*s", (int)sizeof(action) - 1,
+             cJSON_IsString(act) ? act->valuestring : "");
+    snprintf(payload, sizeof(payload), "%.*s", (int)sizeof(payload) - 1,
+             cJSON_IsString(pay) ? pay->valuestring : "");
+
+    if (!pwn_wifi_authorized()) {
+        cJSON_Delete(body);
+        return fail(req, "403 Forbidden",
+                    "unlock active features with the authorization phrase first");
+    }
+    if (!strcmp(action, "stop")) {
+        cJSON_Delete(body);
+        hid_stop();
+        pwn_wifi_event("HID: stopped from web UI");
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject(r, "ok", true);
+        hid_status_fields(r);
+        return send_json(req, r);
+    }
+    if (strcmp(action, "start") && strcmp(action, "run")) {
+        cJSON_Delete(body);
+        return fail(req, "400 Bad Request",
+                    "action must be start, run, or stop");
+    }
+    if (!hid_supported()) {
+        cJSON_Delete(body);
+        return fail(req, "503 Service Unavailable",
+                    "BLE HID is not available in this build");
+    }
+    if (payload[0] && !hid_select(payload)) {
+        cJSON_Delete(body);
+        return fail(req, "404 Not Found",
+                    "payload not found (expected /sdcard/payloads/*.txt)");
+    }
+
+    bool ok = true;
+    if (!strcmp(action, "start")) {
+        ok = hid_start();
+    } else {
+        ok = hid_run(payload[0] ? payload : NULL);
+    }
+    cJSON_Delete(body);
+
+    pwn_hid_status_t st;
+    hid_status(&st);
+    if (!ok) {
+        return fail(req, "409 Conflict", st.error[0] ? st.error : "HID request failed");
+    }
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", true);
+    cJSON_AddStringToObject(r, "action", action);
+    hid_status_fields(r);
+    return send_json(req, r);
+}
+
+static esp_err_t hid_payload_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    if (!pwn_wifi_authorized()) {
+        return fail(req, "403 Forbidden",
+                    "unlock active features with the authorization phrase first");
+    }
+    char query[192];
+    char name[PWN_HID_PAYLOAD_NAME_MAX];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK) {
+        return fail(req, "400 Bad Request", "missing payload name");
+    }
+    int len = req->content_len;
+    if (len <= 0) {
+        return fail(req, "400 Bad Request", "empty payload");
+    }
+    if (len > PWN_HID_PAYLOAD_MAX) {
+        return fail(req, "413 Payload Too Large", "payload exceeds 16 KiB");
+    }
+    char *buf = heap_caps_malloc((size_t)len + 1,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = malloc((size_t)len + 1);
+    }
+    if (!buf) {
+        return fail(req, "500 Internal Server Error", "out of memory");
+    }
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, buf + got, len - got);
+        if (r <= 0) {
+            free(buf);
+            return fail(req, "400 Bad Request", "upload interrupted");
+        }
+        got += r;
+    }
+    buf[got] = 0;
+    char err[96] = "";
+    bool ok = hid_write_payload(name, buf, (size_t)got, err, sizeof(err));
+    free(buf);
+    if (!ok) {
+        return fail(req, "400 Bad Request", err[0] ? err : "cannot save payload");
+    }
+    pwn_wifi_event("HID: payload %s saved (%d bytes)", name, got);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", true);
+    cJSON_AddStringToObject(r, "name", name);
+    cJSON_AddNumberToObject(r, "size", got);
+    cJSON_AddStringToObject(r, "selected", name);
     return send_json(req, r);
 }
 
@@ -2505,6 +2682,9 @@ esp_err_t web_start(void)
         {.uri = "/api/clients",      .method = HTTP_GET,  .handler = clients_get},
         {.uri = "/api/ble",          .method = HTTP_GET,  .handler = ble_get},
         {.uri = "/api/ble",          .method = HTTP_POST, .handler = ble_post},
+        {.uri = "/api/hid",          .method = HTTP_GET,  .handler = hid_get},
+        {.uri = "/api/hid",          .method = HTTP_POST, .handler = hid_post},
+        {.uri = "/api/hid_payload",  .method = HTTP_POST, .handler = hid_payload_post},
         {.uri = "/api/dns",          .method = HTTP_GET,  .handler = dns_get},
         {.uri = "/api/sni",          .method = HTTP_GET,  .handler = sni_get},
         {.uri = "/api/network",      .method = HTTP_GET,  .handler = network_get},

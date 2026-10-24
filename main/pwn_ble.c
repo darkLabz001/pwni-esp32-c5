@@ -27,6 +27,7 @@
 #include "pwn_watch.h"
 #include "pwn_wifi.h"
 #include "pwn_net.h"
+#include "pwn_hid.h"
 
 static const char *TAG = "ble";
 
@@ -37,7 +38,10 @@ static volatile bool s_scanning;
 static volatile bool s_gated;
 static volatile bool s_synced;
 static volatile bool s_supported;
+static volatile bool s_hid_active;
 static TaskHandle_t s_supervisor;
+
+void ble_store_config_init(void);
 
 static uint32_t now_ms(void)
 {
@@ -270,6 +274,7 @@ static void ble_on_sync(void)
         s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
     }
     ESP_LOGI(TAG, "NimBLE synced (own addr type %u)", s_own_addr_type);
+    hid_on_ble_sync();
 }
 
 static void ble_on_reset(int reason)
@@ -277,6 +282,7 @@ static void ble_on_reset(int reason)
     (void)reason;
     s_synced = false;
     s_scanning = false;
+    hid_on_ble_reset();
     ESP_LOGW(TAG, "NimBLE reset (reason %d)", reason);
 }
 
@@ -333,6 +339,9 @@ static void ble_stop_scan(void)
  * operation is allowed with a low BLE duty cycle. */
 static bool ble_allowed_now(void)
 {
+    if (s_hid_active) {
+        return false;
+    }
     pwn_net_status_t n;
     net_get_status(&n);
     if (n.ap_active || n.setup_mode) {
@@ -385,6 +394,7 @@ void ble_init(void)
     s_gated = false;
     s_synced = false;
     s_supported = false;
+    s_hid_active = false;
 
 #if PWN_HAVE_NIMBLE
     esp_err_t err = nimble_port_init();
@@ -396,9 +406,27 @@ void ble_init(void)
     /* Keep Wi-Fi first on the shared radio. BLE is passive and opt-in. */
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
+#if CONFIG_BT_NIMBLE_SECURITY_ENABLE
+    /* Keep SMP available for hosts that want an encrypted HID link. The
+     * keyboard has no display or keypad, so use Just Works pairing with
+     * bonding and LE Secure Connections. The HID module does not force an
+     * early Security Request (BlueZ rejects that before discovery); the
+     * passive observer never pairs. */
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                 BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                   BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+#endif
+    ble_store_config_init();
+    hid_gatt_init();
+
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
-    ble_hs_cfg.store_status_cb = NULL;
     nimble_port_freertos_init(ble_host_task);
 
     if (xTaskCreate(ble_supervisor, "pwn_ble", 3072, NULL, 3,
@@ -444,6 +472,29 @@ bool ble_scanning(void)
 bool ble_gated(void)
 {
     return s_gated;
+}
+
+bool ble_hid_set_active(bool on)
+{
+    bool changed = (s_hid_active != on);
+    s_hid_active = on;
+#if PWN_HAVE_NIMBLE
+    if (on && changed) {
+        /* Advertising and discovery cannot share the controller. Cancel the
+         * observer synchronously before the HID module starts advertising. */
+        ble_stop_scan();
+    }
+#endif
+    if (changed) {
+        ESP_LOGI(TAG, "HID mode %s; passive scanner %s", on ? "on" : "off",
+                 on ? "paused" : "will resume if enabled");
+    }
+    return true;
+}
+
+bool ble_hid_active(void)
+{
+    return s_hid_active;
 }
 
 int ble_device_count(void)

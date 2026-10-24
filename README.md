@@ -5,6 +5,8 @@
 > [!WARNING]
 > Active deauthentication is compiled into this build (`PWN_ENABLE_DEAUTH=1`) but remains **locked at runtime**. You must enter the authorization phrase on the device, over serial, or in the web UI. Auto-deauth is off by default. Only use active features against networks you own or have explicit written permission to test. See [docs/LEGAL.md](docs/LEGAL.md).
 >
+> **BLE HID keyboard is experimental and active.** It advertises as `PWNI-KBD` and types a payload into the host that connects. It is opt-in, requires the authorization phrase, is off after every boot, and pauses the passive BLE scanner while active. Never run it against a host you do not own or have explicit written permission to test. See [docs/HID.md](docs/HID.md).
+>
 > **ESP32-C5 deauth patch:** stock ESP-IDF rejects raw deauthentication frames with `ESP_ERR_INVALID_ARG`. This workspace applies the one-instruction `libnet80211.a` patch and was tested by disconnecting a real client with the 8-second burst. If you reinstall/update ESP-IDF, reapply it with `python3 tools/patch_c5_deauth.py --apply` and rebuild. See [docs/C5_DEAUTH.md](docs/C5_DEAUTH.md).
 >
 > **Deauth is an 8-second burst**, not a single frame. Clients often reassociate in about a second after one frame; the burst keeps them down while it runs. The web UI has a **Stop** button, and the device skips its own STA. Targeting the machine running your browser will drop the dashboard until that client reconnects.
@@ -21,6 +23,7 @@
 - **Setup AP fallback** — with no saved credentials, or after 30 seconds of failed station joins, the device starts an open `PWNI-Setup-XXXX` SoftAP at `http://192.168.4.1/` so the dashboard can be used to configure Wi-Fi. The AP is pinned to channel 1, channel hopping pauses, and the AP stops as soon as the station gets an IP. The setup AP has **no Wi-Fi password**; anyone in radio range can reach the dashboard while it is active, though the dashboard still requires `admin` / `ADMIN` Basic auth. Use it only long enough to join your own network.
 - **Web dashboard** — served on port 80 at `http://<device-ip>/` with live status, networks, clients, passive recon, captures, PCAP download, attack controls, and settings.
 - **Passive BLE observer** — opt-in NimBLE scanner (off by default) that records address/address type, name, RSSI, advertised service UUIDs, and common beacon types (iBeacon, Eddystone, AltBeacon, Exposure Notification, Fast Pair). It never connects, pairs, writes, or sends scan requests. Wi-Fi keeps coexistence priority; scanning pauses while the setup AP or a deauth burst owns the radio.
+- **BLE HID keyboard (experimental)** — opt-in, runtime-authorized HID-over-GATT keyboard. It advertises as `PWNI-KBD`, accepts a host connection, and types a selected DuckyScript-style text payload from `/sdcard/payloads/*.txt` (text, `DELAY`, `ENTER`/`TAB`/`ESC`, modifier combos, `REM`). HID mode is never started automatically, pauses the passive BLE scanner for the whole session, releases keys on stop, and logs start/stop/execution in `last_event`. It stores no target data. Only use it on hosts you own or have written permission to test. See [docs/HID.md](docs/HID.md).
 - **Passive DNS / SNI / HTTP visibility** — parses DNS question names, TLS ClientHello SNI, and HTTP `Host` headers from unprotected 802.11 data frames, with bounded tables, counts, and timestamps. Only metadata is retained: no payloads, URLs, cookies, query answers, or credentials. WPA/WPA2/WPA3 traffic is encrypted and remains invisible.
 - **Client fingerprinting** — a small built-in OUI vendor table, locally-administered/randomized MAC detection, first/last-seen timestamps, and the last few unique probe-request SSIDs per client.
 - **Persistent watchlist** — add watched SSIDs, Wi-Fi MACs, or BLE addresses/names from the web UI. Matches are stored in NVS, raise a dashboard badge/toast, and appear in `/api/status` (`watch_*` fields plus `last_event`). Passive matching only.
@@ -56,7 +59,7 @@ Open the serial console at 115200 baud, or use `idf.py -p /dev/ttyACM0 monitor`.
 capture: SD card mounted, handshakes -> /sdcard/handshakes
 esp32_c5_touch_lcd_3_5: Touch ready: raw 320x480 swap=0 mirror_x=0 mirror_y=0
 esp_lvgl:touch: Touch input device registered successfully (IRQ mode: disabled)
-web: web UI listening on :80 (34 handlers)
+web: web UI listening on :80 (37 handlers)
 net: got IP <device-ip> — web UI: http://<device-ip>/
 ```
 
@@ -91,7 +94,7 @@ Open `http://<device-ip>/` from a device on the same network. If the device is i
 - **BLE** — opt-in passive BLE scanner state and recent advertisers (address type, name, RSSI, service UUIDs, beacon type).
 - **Net intel** — recent DNS queries, TLS SNI hosts, HTTP `Host` headers, and top talkers.
 - **Caps** — captured handshakes and PMKIDs from this session, plus a **Saved PCAPs** table read from the SD card (survives reboots), with PCAP download.
-- **Attack** — authorization state, deauthentication, capture hunt, auto-deauth, pause/hop controls.
+- **Attack** — authorization state, deauthentication, capture hunt, BLE HID keyboard payloads, auto-deauth, pause/hop controls.
 - **Set** — Wi-Fi connection, display brightness, maintenance, system information.
 
 ### API
@@ -105,6 +108,9 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 | GET | `/api/clients` | Observed client table with vendor, randomized flag, probes, first/last seen |
 | GET | `/api/ble` | Passive BLE state and recent advertisers |
 | POST | `/api/ble` | Enable/disable passive BLE scanning (`{"enabled":true}`) |
+| GET | `/api/hid` | BLE HID state and `/sdcard/payloads` list |
+| POST | `/api/hid` | Start HID mode, run a payload, or stop (`action`: `start`, `run`, `stop`) |
+| POST | `/api/hid_payload?name=<file>` | Upload a raw text payload (1–16 KiB, `.txt`) |
 | GET | `/api/dns` | Recent DNS question names with counts and timestamps |
 | GET | `/api/sni` | Recent TLS ClientHello SNI hosts with counts and timestamps |
 | GET | `/api/network` | Combined DNS/SNI/HTTP metadata plus top talkers |
@@ -132,6 +138,8 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase is a deliberate speed bump, not a security boundary. `ADMIN` is intentionally weak and guessable; change `PWN_AUTH_PHRASE` in `main/pwn_config.h` if the device is accessible to others. Auto-deauth defaults to off. Deauth starts an 8-second burst and returns immediately; send `{"stop":true}` to stop it. Deauth and hop calls that need an exclusive radio return `409 Conflict` while associated.
 
 `POST /api/hunt` returns immediately with `started`, the target `bssid`/`sta`, `duration_ms`, and a PMF `warning` when relevant. `/api/status` exposes `hunt_active`, `hunt_result` (`idle`, `hunting`, `captured`, `timeout`, `stopped`, `error`), `hunt_bssid`, `hunt_sta`, `hunt_elapsed_ms`, `hunt_duration_ms`, `hunt_file`, and `hunt_message`. The deauth burst is stopped as soon as a complete 4-way handshake or PMKID is saved for the target, or when the duration expires; hunts require the same runtime unlock as deauth.
+
+BLE HID is a separate, explicitly authorized mode. `POST /api/hid {"action":"start","payload":"hello.txt"}` starts advertising but does **not** type anything; `{"action":"run","payload":"hello.txt"}` types a payload only after a host is connected and subscribed. `{"action":"stop"}` releases keys, disconnects, and restores the observer. `/api/status` exposes `hid_supported`, `hid_active`, `hid_connected`, `hid_encrypted`, `hid_subscribed`, `hid_executing`, `hid_state`, `hid_payload`, `hid_line`, `hid_lines`, and `hid_chars`. HID mode pauses the passive BLE scanner (Wi-Fi and BLE share the radio) and stops on lock, BLE reset, or after 5 minutes with no host. It is off after every boot and never runs a payload automatically. See [docs/HID.md](docs/HID.md).
 
 Passive recon is always receive-only. `/api/ble` reports `supported`, `enabled`, `scanning`, `gated`, and a bounded `devices` table; scanning is off after boot until explicitly enabled, and pauses when `ap_active`/`setup_mode` or a deauth burst is using the radio. `/api/dns`, `/api/sni`, and `/api/network` contain names, counts, and uptime-based `first_seen_ms`/`last_seen_ms` only; they cannot see WPA/WPA2/WPA3-encrypted payloads. `/api/watch` accepts `type` values `ssid`, `mac`, and `ble` (BLE address or advertised name). Matches are stored in NVS and reported through `/api/status` as `watch_count`, `watch_hits`, `watch_last`, and `watch_age_ms`; a recent match also replaces `last_event` for 60 seconds so it is visible to simple pollers.
 
@@ -194,6 +202,7 @@ Key settings live in [`main/pwn_config.h`](main/pwn_config.h):
 - `PWN_COUNTRY` — regulatory domain; defaults to `US`. Change it to your country.
 - `PWN_EPOCH_MS`, `PWN_MAX_APS`, `PWN_MAX_CLIENTS`, `PWN_MAX_HS`, `PWN_RB_BYTES` — behavior and table sizing.
 - Passive recon tables are fixed at compile time: `PWN_DNS_MAX`, `PWN_HOST_MAX`, `PWN_TALKER_MAX` in `main/pwn_netmeta.h`, `PWN_BLE_MAX` in `main/pwn_ble.h`, and `PWN_WATCH_MAX` in `main/pwn_watch.h`. The AP/client/BLE tables and large web snapshots live in PSRAM.
+- BLE HID limits and paths live in `main/pwn_hid.h`: `/sdcard/payloads`, 24 listed payloads, 64-character names, and a 16 KiB payload cap. HID mode always requires the runtime authorization phrase. There is no separate compile-time HID switch; remove the `pwn_hid.c` source and HID GATT calls if you need a build with no HID code.
 
 Build defaults include the NimBLE observer role only (`CONFIG_BT_NIMBLE_ENABLED=y`, observer on, central/peripheral/broadcaster/security/GATT off). BLE scanning itself remains a runtime opt-in and starts **off** after every boot; `/api/ble` or the web **BLE** tab enables it for the current session. If you need a smaller image with no Bluetooth at all, remove the `bt`/`esp_coex` requirements and the BLE source from `main/CMakeLists.txt` and the `CONFIG_BT_*` block from `sdkconfig.defaults`; the web API then reports `ble_supported: false`.
 
@@ -231,6 +240,7 @@ main/
 ├── pwn_watch.*         # Persistent SSID/MAC/BLE watchlist and alert cooldown
 ├── pwn_netmeta.*       # Passive DNS/SNI/HTTP metadata and top-talker counters
 ├── pwn_ble.*           # Opt-in passive NimBLE observer
+├── pwn_hid.*           # Opt-in BLE HID keyboard + payload parser
 ├── pwn_oui.*           # Small built-in OUI vendor table / randomized-MAC bit
 ├── pwn_web.*           # HTTP server, JSON APIs, PCAP download
 ├── pwn_web_page.h      # Embedded dashboard HTML/JS/CSS
@@ -253,6 +263,9 @@ docs/                   # Hardware, architecture, legal notes
 - **UI freezes during heavy SD activity** — SD and LCD share SPI2; the firmware serializes access, but a failing card can still stall. Remove the card and reboot to confirm.
 - **BLE tab stays empty** — BLE scanning is opt-in and off after every boot. Enable it in the **BLE** tab or with `POST /api/ble {"enabled":true}`. If `gated` is true, the setup AP or an active deauth burst owns the radio; wait for it to finish. `supported: false` means the firmware was built without NimBLE.
 - **BLE scanning pauses or feels slow** — Wi-Fi and BLE share the 2.4 GHz radio. The firmware sets Wi-Fi coexistence priority and uses a low-duty passive scan; expect fewer advertisers than a dedicated BLE scanner. If you see Wi-Fi drops while BLE is on, leave BLE off; it is not required for any other feature.
+- **HID mode will not start** — unlock active features first (`ADMIN` in **Attacks** or `POST /api/auth`). HID also needs the SD card mounted for payloads and cannot advertise while the setup AP or a deauth burst owns the radio. Starting HID always pauses the BLE scanner; the dashboard shows `HID: advertising` in `last_event`.
+- **Host sees `PWNI-KBD` but never receives keystrokes** — the payload only runs after the host subscribes to the keyboard input report. Pair/connect from the host, wait for `hid_subscribed: true` (or the dashboard's "keyboard reports subscribed"), then press **Type payload**. Some Linux/BlueZ setups expose the GATT service without binding the HID input driver until the host pairs explicitly. HID mode is experimental; use a host that supports BLE HID keyboards.
+- **HID stopped by itself** — the firmware stops HID when the authorization is revoked, when NimBLE resets, or after 5 minutes with no host. It also aborts typing if the host disconnects. Nothing is auto-restarted after a reboot.
 - **DNS/SNI/HTTP tables stay empty on a WPA2/WPA3 network** — expected. Those payloads are encrypted; the parser only sees unprotected frames (open networks or unencrypted management/data). It stores names and counters only, never payloads or credentials.
 - **Deauth returns 403** — active attacks are locked. Unlock with `ADMIN` (case-insensitive) in `SET`, the CLI, or `/api/auth`. While associated, deauth/hop requests that need an exclusive radio return `409`.
 - **Deauth says `0 frames` or `tx_error: ESP_ERR_INVALID_ARG`** — you are unlocked, but the C5 Wi-Fi library is refusing the frame. Run `python3 tools/patch_c5_deauth.py --check`. If it says `STOCK`, apply the patch (`--apply`), run `idf.py fullclean && idf.py build`, and reflash. If it says `PATCHED`, the target is on another channel while associated (disconnect first), the BSSID/station is invalid, or the client uses protected management frames (PMF). See [docs/C5_DEAUTH.md](docs/C5_DEAUTH.md).

@@ -80,6 +80,28 @@ Interference with radio communications can carry separate civil and criminal pen
 - RF exposure limits vary. Do not modify the antenna or increase transmit power without checking local rules.
 - Deauth frames can disrupt legitimate users, including emergency calls and industrial control traffic. Never send them casually.
 
+## BLE HID keyboard
+
+The BLE HID keyboard is an **active** feature. When started it advertises as a
+Bluetooth keyboard and types the selected payload into the host that connects
+and subscribes. It is off after every boot, requires the same runtime
+authorization phrase as deauth, stops when the authorization is revoked, and
+never runs a payload automatically.
+
+Authorized HID testing requires the same permission as any other active test:
+you must own the host, or have explicit written permission from its owner. Do
+not pair with or type into a device you do not control, even if it appears in
+the scanner. HID payloads can trigger arbitrary actions through the host's
+keyboard input. The bundled payloads in [`dist/payloads`](../dist/payloads)
+only open a text editor and type a test string; do not add credential theft,
+data exfiltration, persistence, or destructive commands.
+
+The device stores only the payload name/state in RAM for the dashboard. It does
+not record the host address, typed text, or host responses. `last_event`
+contains start/stop/connection/execution status only. Removing the payload
+files from the SD card and stopping HID mode removes the capability until it is
+explicitly started again.
+
 ## How to disable active features
 
 For a purely passive build, set the following in [`main/pwn_config.h`](../main/pwn_config.h) and rebuild:
@@ -89,6 +111,11 @@ For a purely passive build, set the following in [`main/pwn_config.h`](../main/p
 ```
 
 With that flag at `0`, the active deauth path is compiled out. Leaving the runtime lock engaged has the same practical effect for normal use, but the compile-time flag is the stronger guarantee.
+
+There is no separate compile-time switch for BLE HID. To remove it from a build,
+drop `pwn_hid.c` from `main/CMakeLists.txt`, remove the `hid_*` calls from
+`app_main.c`/`pwn_ble.c`, and disable the peripheral/GATT-server/SMP options in
+`sdkconfig.defaults`. The HID endpoints then report `hid_supported: false`.
 
 ## No warranty
 

@@ -1,0 +1,5 @@
+REM Benign BLE HID demo: type a short test string into the focused window.
+REM Only run this on a machine you own or have written permission to test.
+DELAY 500
+STRING Hello from PWNI BLE HID.
+ENTER

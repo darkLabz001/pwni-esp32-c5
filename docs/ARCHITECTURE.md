@@ -27,7 +27,8 @@ app_main ──► pet_tick() every 100 ms ──► pwn_pet (moods, reward, bra
 |---|---|---|
 | `app_main` | `main/app_main.c` | Bring-up, then `pet_tick()` every 100 ms |
 | `recon` | `main/pwn_wifi.c` | Ring-buffer receive, 802.11 parsing, table updates, passive DNS/SNI/HTTP parsing, watchlist rescan, EAPOL/PMKID handoff, hopping, scan |
-| `pwn_ble` | `main/pwn_ble.c` | NimBLE host task + supervisor; passive advertisements and watch matches |
+| `pwn_ble` | `main/pwn_ble.c` | NimBLE host task + supervisor; passive advertisements, watch matches, HID radio gate |
+| `pwn_hid` | `main/pwn_hid.c` | Authorized BLE HID keyboard GATT service, payload parser, typing task |
 | LVGL task | `esp_lvgl_adapter` | Rendering; the UI timer runs inside the LVGL context |
 | HTTP server | `main/pwn_web.c` | `esp_http_server` on port 80, 8 KiB stack, 4 open sockets |
 | CLI | `main/pwn_cli.c` | USB-Serial/JTAG line input, 16 KiB stack (large enough to snapshot UI state) |
@@ -96,20 +97,31 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - DNS: parses only the question section, handles compression pointers defensively, and ignores responses. SNI: bounds-checked TLS record/handshake/extension walk. HTTP: request methods only, extracts `Host`, strips a non-IPv6 port. No query answers, URLs, cookies, or bodies are retained.
 - IPv4 only; WPA/WPA2/WPA3 data frames are encrypted and therefore not visible. The parser is bounds-checked and is validated with synthetic DNS/SNI/HTTP frames that exercise name compression, SNI extension walking, Host parsing, and talker accounting.
 
-### `pwn_ble` — passive NimBLE observer
+### `pwn_ble` — passive NimBLE observer and HID radio gate
 
-- Built with the NimBLE observer role only (no central/peripheral/broadcaster, GATT, pairing, or NVS persistence). `nimble_port_freertos_init()` owns the host task; a 1 s supervisor starts/stops scanning.
+- Built with the NimBLE observer + peripheral/broadcaster/GATT-server roles and SMP. `nimble_port_freertos_init()` owns the host task; a 1 s supervisor starts/stops scanning. The observer never connects, pairs, writes, or sends scan requests.
 - Scan parameters are passive with a low duty cycle (100 ms interval / 40 ms window) and duplicate filtering off for fresh RSSI. `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` keeps Wi-Fi first on the shared 2.4 GHz radio.
-- Runtime opt-in, off after every boot. Scanning is gated off while the setup AP is active or a deauth burst is in flight. No connection, scan-request, or write API is called.
+- Runtime opt-in, off after every boot. Scanning is gated off while the setup AP is active, a deauth burst is in flight, or BLE HID mode is active. `ble_hid_set_active(true)` cancels discovery synchronously before HID starts advertising; clearing it lets the supervisor restart the scan if the user had enabled it.
 - Parses address/address type, name, RSSI, 16/32/128-bit service UUIDs, and common beacon formats (iBeacon, Eddystone, AltBeacon, Exposure Notification, Fast Pair, URI). The device table lives in PSRAM and is LRU-bounded.
+
+### `pwn_hid` — authorized BLE HID keyboard
+
+- Registers a keyboard-only HID-over-GATT service during BLE bring-up: HID Information, Report Map, Control Point, Protocol Mode, Report (Report ID 2, input and LED output), and Boot Keyboard input/output. Appearance is `0x03C1`; the advertising name is `PWNI-KBD`.
+- Off after every boot. `hid_start()` requires `pwn_wifi_authorized()` and only enables connectable advertising; it never executes a payload. `hid_run()` additionally requires a connected host with a subscription to the Report or Boot Keyboard Input characteristic.
+- SMP is enabled for Just Works pairing with bonding and LE Secure Connections; bonds use the NimBLE store and Wi-Fi credentials remain in their own NVS entries. The firmware deliberately does **not** send an early Security Request on connect: BlueZ rejects that before service discovery and the CCCD write can hang. A host that requires encryption initiates pairing itself. Report characteristics are readable without encryption so generic GATT clients can subscribe and receive reports; if the host pairs, `hid_encrypted` becomes true.
+- The payload parser supports `REM`, `DELAY`, `DEFAULTDELAY`, `STRING`/`STRINGLN`, plain text, navigation/function keys, US-layout shifted symbols, and modifier combinations. Runs are line-by-line with a 16 KiB file cap.
+- The typing task copies the SD file into PSRAM under `capture_bus_lock()` and releases the shared SD/display bus before sending reports. Reports are 8 bytes (modifiers, reserved, six keys); a key press is always followed by a release, including on abort.
+- LVGL is paused with `esp_lv_adapter_pause()` for the duration of a payload and resumed when it ends. The LCD's SPI flush falls back to an internal DMA bounce buffer because the draw buffers are in PSRAM; BLE notification traffic can fragment the internal heap enough that the bounce allocation fails and LVGL waits forever for a flush completion. The web UI still reports progress while rendering is paused. The BSP draw buffer is 20 lines (~12.8 KiB per transfer) for the same headroom reason.
+- HID mode stops on authorization revocation, NimBLE reset, or 5 minutes without a host. Disconnect aborts the run. No target address, typed text, or payload output is stored; `last_event` carries only start/stop/connection/execution status.
 
 ### `pwn_web` — dashboard and JSON API
 
-- `esp_http_server` on port 80; 34 registered handlers; 4 open sockets; LRU purge enabled.
-- The root page is embedded from `pwn_web_page.h` (about 44 KB) and uses a dark dashboard with tabs: Dash, Nets, Clients, BLE, Net intel, Caps, Attack, Set.
+- `esp_http_server` on port 80; registered handlers cover status, recon, captures, controls, HID, and OTA; 4 open sockets; LRU purge enabled.
+- The root page is embedded from `pwn_web_page.h` and uses a dark dashboard with tabs: Dash, Nets, Clients, BLE, Net intel, Caps, Attack, Set.
 - Read APIs snapshot the pet/wifi/capture/BLE/netmeta tables into `cJSON` documents. `/api/hs` also scans `/sdcard/handshakes` for saved PCAPs, so the dashboard's archive survives reboots.
-- Recon APIs: `/api/ble`, `/api/dns`, `/api/sni`, `/api/network`, and `/api/watch`. `/api/clients` adds `vendor`, `randomized`, `probes`, `first_seen_ms`, and `last_seen_ms`. `/api/status` adds passive counters, BLE state, internal-heap diagnostics, and watch fields.
-- Control APIs call `pwn_net`, `pwn_wifi`, `pwn_hunt`, `pwn_pet`, and `bsp_display_brightness_set`.
+- Recon APIs: `/api/ble`, `/api/dns`, `/api/sni`, `/api/network`, and `/api/watch`. `/api/clients` adds `vendor`, `randomized`, `probes`, `first_seen_ms`, and `last_seen_ms`. `/api/status` adds passive counters, BLE state, HID state, internal-heap diagnostics, and watch fields.
+- HID APIs: `GET /api/hid` lists state and `/sdcard/payloads`; `POST /api/hid` performs `start`/`run`/`stop`; `POST /api/hid_payload?name=` uploads a text payload atomically (1–16 KiB). Start/run/upload require the runtime unlock.
+- Control APIs call `pwn_net`, `pwn_wifi`, `pwn_hunt`, `pwn_hid`, `pwn_pet`, and `bsp_display_brightness_set`.
 - PCAP download validates the requested basename with `safe_name()`, opens the file under the SD bus lock, and streams it with `Content-Disposition: attachment`.
 - Active-attack endpoints check `pwn_wifi_authorized()` and return `403` while locked. `/api/hunt` starts/stops the capture hunt and `/api/status` reports its state. Channel-changing endpoints return `409 Conflict` while associated.
 - Authorization is case-insensitive: `/api/auth` with `{"phrase":"ADMIN"}` (or any case variant) unlocks; `{"off":true}` locks.
@@ -156,7 +168,7 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - AP table: `PWN_MAX_APS` (96) entries; client table: `PWN_MAX_CLIENTS` (128) entries; handshake table: `PWN_MAX_HS` (24). AP/client/BLE tables and large UI/web snapshots are allocated in PSRAM; this keeps enough internal SRAM for the NimBLE host/controller, Wi-Fi, TLS, HTTP, and task stacks. Measured idle internal-heap headroom with BLE available but not scanning is about 48–50 KiB, with a similar minimum.
 - Passive recon tables: DNS 24 × 80 B, SNI/HTTP 24 × 80 B each, talkers 16 entries, BLE 48 devices, watchlist 24 entries. Bounds are compile-time constants.
 - LVGL draw buffers and UI snapshot buffers live in PSRAM.
-- Task stacks: CLI 16 KiB, HTTP server 8 KiB, LVGL draw thread 8 KiB, main task 8 KiB, NimBLE host 4 KiB, BLE supervisor 3 KiB.
+- Task stacks: CLI 16 KiB, HTTP server 8 KiB, LVGL draw thread 8 KiB, main task 8 KiB, NimBLE host 4 KiB, BLE supervisor 3 KiB, HID supervisor 3 KiB, HID typist 6 KiB (created only while a payload runs).
 
 ## Build configuration
 
@@ -165,5 +177,5 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - LVGL 9, RGB565, Montserrat 12/14/16/20/24/28 and UNSCII 8/16 fonts.
 - USB-Serial/JTAG console (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, UART console off).
 - FATFS long filenames, Wi-Fi RX/TX buffer tuning, HTTP server limits (`CONFIG_LWIP_MAX_SOCKETS=10`, 1024-byte request headers, 512-byte URI).
-- NimBLE observer only: Bluetooth enabled, NimBLE host, observer role, internal memory allocation, no central/peripheral/broadcaster/security/GATT/extended advertising. BLE scanning is a runtime opt-in and defaults off.
+- NimBLE observer + HID peripheral: Bluetooth enabled, NimBLE host, observer/peripheral/broadcaster roles, GATT server, SMP with Just Works bonding, internal memory allocation, no central role, no extended advertising. BLE scanning and HID mode are separate runtime opt-ins and both default off; HID additionally requires the authorization phrase and pauses the observer.
 - `PWN_ENABLE_DEAUTH` defaults to `1`, but active transmissions require the runtime phrase; `PWN_AUTH_PHRASE` is `ADMIN` and matching is case-insensitive. Auto-deauth defaults to off. Setting `PWN_ENABLE_DEAUTH` to `0` removes the active path entirely. Active deauth on the C5 also needs the local `libnet80211.a` patch; see [C5_DEAUTH.md](C5_DEAUTH.md). Stock IDF returns `ESP_ERR_INVALID_ARG`.

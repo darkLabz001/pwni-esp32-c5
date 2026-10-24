@@ -1,0 +1,12 @@
+REM Benign macOS demo: open TextEdit and type a test message.
+REM Authorized use only. Nothing is saved or sent by the device.
+DELAY 1200
+GUI space
+DELAY 800
+STRING TextEdit
+DELAY 600
+ENTER
+DELAY 1800
+STRING PWNI BLE HID demo - authorized use only
+ENTER
+STRING This text was typed over BLE HID.

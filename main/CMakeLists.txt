@@ -10,6 +10,7 @@ idf_component_register(
         "pwn_watch.c"
         "pwn_netmeta.c"
         "pwn_ble.c"
+        "pwn_hid.c"
         "pwn_oui.c"
         "pwn_pet.c"
         "pwn_ui.c"

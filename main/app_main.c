@@ -19,6 +19,7 @@
 #include "pwn_watch.h"
 #include "pwn_netmeta.h"
 #include "pwn_ble.h"
+#include "pwn_hid.h"
 
 static const char *TAG = "pwni";
 
@@ -50,6 +51,7 @@ void app_main(void)
      * flushed stalls the panel transaction and trips the task watchdog. */
     capture_init();
     pwn_hunt_init();
+    hid_init();
 
     lv_display_t *disp = bsp_display_start();
     if (!disp) {

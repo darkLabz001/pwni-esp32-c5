@@ -1,0 +1,12 @@
+REM Benign Windows demo: open Notepad and type a test message.
+REM Authorized use only. Nothing is saved or sent by the device.
+DELAY 1200
+GUI r
+DELAY 800
+STRING notepad
+DELAY 600
+ENTER
+DELAY 1500
+STRING PWNI BLE HID demo - authorized use only
+ENTER
+STRING This text was typed over BLE HID.
