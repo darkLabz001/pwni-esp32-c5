@@ -32,6 +32,10 @@
 #include "pwn_pet.h"
 #include "pwn_net.h"
 #include "pwn_web_page.h"
+#include "pwn_watch.h"
+#include "pwn_ble.h"
+#include "pwn_netmeta.h"
+#include "pwn_oui.h"
 
 static const char *TAG = "web";
 
@@ -212,6 +216,10 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddStringToObject(r, "fw", PWN_VERSION);
     cJSON_AddNumberToObject(r, "uptime", esp_timer_get_time() / 1000000ULL);
     cJSON_AddNumberToObject(r, "heap_free", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(r, "heap_internal_free",
+                            heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(r, "heap_internal_min",
+                            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(r, "psram_free",
                             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
@@ -238,6 +246,33 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(r, "dropped", st->dropped);
     cJSON_AddNumberToObject(r, "channel", st->channel);
     cJSON_AddNumberToObject(r, "band", st->band);
+
+    /* Passive recon counters. All values are metadata only. */
+    pwn_netmeta_counts_t nm;
+    netmeta_counts(&nm);
+    cJSON_AddNumberToObject(r, "dns_total", nm.dns_total);
+    cJSON_AddNumberToObject(r, "dns_count", nm.dns_count);
+    cJSON_AddNumberToObject(r, "sni_total", nm.sni_total);
+    cJSON_AddNumberToObject(r, "sni_count", nm.sni_count);
+    cJSON_AddNumberToObject(r, "http_total", nm.http_total);
+    cJSON_AddNumberToObject(r, "http_count", nm.http_count);
+    cJSON_AddNumberToObject(r, "talker_count", nm.talker_count);
+    cJSON_AddBoolToObject(r, "ble_supported", ble_supported());
+    cJSON_AddBoolToObject(r, "ble_enabled", ble_enabled());
+    cJSON_AddBoolToObject(r, "ble_scanning", ble_scanning());
+    cJSON_AddBoolToObject(r, "ble_gated", ble_gated());
+    cJSON_AddNumberToObject(r, "ble_count", ble_device_count());
+
+    int watch_count = 0;
+    uint32_t watch_hits = 0;
+    uint32_t watch_age = 0;
+    char watch_last[96] = "";
+    watch_status(&watch_count, &watch_hits, watch_last, sizeof(watch_last),
+                 &watch_age);
+    cJSON_AddNumberToObject(r, "watch_count", watch_count);
+    cJSON_AddNumberToObject(r, "watch_hits", watch_hits);
+    cJSON_AddStringToObject(r, "watch_last", watch_last);
+    cJSON_AddNumberToObject(r, "watch_age_ms", watch_age);
     cJSON_AddBoolToObject(r, "paused", pet.paused);
     cJSON_AddBoolToObject(r, "locked", pwn_wifi_locked());
     cJSON_AddBoolToObject(r, "authorized", pwn_wifi_authorized());
@@ -268,8 +303,11 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(r, "hunt_saved", hunt.saved);
     cJSON_AddStringToObject(r, "hunt_file", hunt.file);
     cJSON_AddStringToObject(r, "hunt_message", hunt.message);
-    cJSON_AddStringToObject(r, "last_event",
-                            st->last_event[0] ? st->last_event : "listening...");
+    const char *last_event = st->last_event[0] ? st->last_event : "listening...";
+    if (watch_last[0] && watch_age < 60000) {
+        last_event = watch_last;   /* keep a recent watch hit visible */
+    }
+    cJSON_AddStringToObject(r, "last_event", last_event);
     cJSON_AddBoolToObject(r, "sd", capture_sd_ready());
     pwn_sd_info_t sdinfo;
     if (capture_sd_info(&sdinfo)) {
@@ -335,7 +373,7 @@ static esp_err_t aps_get(httpd_req_t *req)
         return fail(req, "500 Internal Server Error", "out of memory");
     }
     int n = pwn_wifi_ap_snapshot(aps, PWN_MAX_APS);
-    pwn_client_t *cls = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
+    pwn_client_t *cls = big_calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
     int cn = cls ? pwn_wifi_client_snapshot(cls, PWN_MAX_CLIENTS) : 0;
     uint8_t self[6];
     pwn_wifi_self_mac(self);
@@ -376,7 +414,7 @@ static esp_err_t clients_get(httpd_req_t *req)
     if (!web_auth(req)) {
         return ESP_OK;
     }
-    pwn_client_t *c = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
+    pwn_client_t *c = big_calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
     if (!c) {
         return fail(req, "500 Internal Server Error", "out of memory");
     }
@@ -395,6 +433,16 @@ static esp_err_t clients_get(httpd_req_t *req)
         cJSON_AddStringToObject(o, "bssid", bssid);
         cJSON_AddNumberToObject(o, "rssi", c[i].rssi);
         cJSON_AddNumberToObject(o, "frames", c[i].frames);
+        cJSON_AddStringToObject(o, "vendor", pwn_oui_vendor(c[i].mac));
+        cJSON_AddBoolToObject(o, "randomized", c[i].randomized != 0);
+        cJSON_AddNumberToObject(o, "first_seen_ms", c[i].first_seen_ms);
+        cJSON_AddNumberToObject(o, "last_seen_ms", c[i].last_seen_ms);
+        cJSON *probes = cJSON_AddArrayToObject(o, "probes");
+        for (int k = 0; k < c[i].probe_count &&
+                        k < (int)(sizeof(c[i].probes) / sizeof(c[i].probes[0])); k++) {
+            cJSON_AddItemToArray(probes,
+                                 cJSON_CreateString(c[i].probes[k]));
+        }
         bool zero_bssid = (c[i].bssid[0] | c[i].bssid[1] | c[i].bssid[2] |
                            c[i].bssid[3] | c[i].bssid[4] | c[i].bssid[5]) == 0;
         bool self_bssid = memcmp(c[i].bssid, c[i].mac, 6) == 0;
@@ -404,6 +452,293 @@ static esp_err_t clients_get(httpd_req_t *req)
     }
     free(c);
     return send_json(req, root);
+}
+
+static void add_talker_array(cJSON *root)
+{
+    pwn_talker_t *t = big_calloc(PWN_TALKER_MAX, sizeof(*t));
+    int n = t ? netmeta_talker_snapshot(t, PWN_TALKER_MAX) : 0;
+    if (n > 1) {
+        for (int i = 1; i < n; i++) {
+            pwn_talker_t key = t[i];
+            int j = i - 1;
+            while (j >= 0 && t[j].bytes < key.bytes) {
+                t[j + 1] = t[j];
+                j--;
+            }
+            t[j + 1] = key;
+        }
+    }
+    cJSON *arr = cJSON_AddArrayToObject(root, "talkers");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        char mac[18];
+        mac_str(t[i].mac, mac);
+        cJSON_AddStringToObject(o, "mac", mac);
+        cJSON_AddStringToObject(o, "vendor", pwn_oui_vendor(t[i].mac));
+        cJSON_AddStringToObject(o, "ip", t[i].ip);
+        cJSON_AddNumberToObject(o, "frames", t[i].frames);
+        cJSON_AddNumberToObject(o, "bytes", t[i].bytes);
+        cJSON_AddNumberToObject(o, "first_seen_ms", t[i].first_seen_ms);
+        cJSON_AddNumberToObject(o, "last_seen_ms", t[i].last_seen_ms);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(t);
+}
+
+static void add_dns_array(cJSON *root)
+{
+    pwn_dns_entry_t *d = big_calloc(PWN_DNS_MAX, sizeof(*d));
+    int n = d ? netmeta_dns_snapshot(d, PWN_DNS_MAX) : 0;
+    cJSON *arr = cJSON_AddArrayToObject(root, "dns");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name", d[i].name);
+        cJSON_AddNumberToObject(o, "qtype", d[i].qtype);
+        cJSON_AddNumberToObject(o, "count", d[i].count);
+        cJSON_AddNumberToObject(o, "first_seen_ms", d[i].first_seen_ms);
+        cJSON_AddNumberToObject(o, "last_seen_ms", d[i].last_seen_ms);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(d);
+}
+
+static void add_host_array(cJSON *root, const char *key, pwn_host_entry_t *h,
+                           int n)
+{
+    cJSON *arr = cJSON_AddArrayToObject(root, key);
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "host", h[i].host);
+        cJSON_AddNumberToObject(o, "count", h[i].count);
+        cJSON_AddNumberToObject(o, "first_seen_ms", h[i].first_seen_ms);
+        cJSON_AddNumberToObject(o, "last_seen_ms", h[i].last_seen_ms);
+        cJSON_AddItemToArray(arr, o);
+    }
+}
+
+static esp_err_t ble_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    pwn_ble_dev_t *d = big_calloc(PWN_BLE_MAX, sizeof(*d));
+    if (!d) {
+        return fail(req, "500 Internal Server Error", "out of memory");
+    }
+    int n = ble_snapshot(d, PWN_BLE_MAX);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "supported", ble_supported());
+    cJSON_AddBoolToObject(root, "enabled", ble_enabled());
+    cJSON_AddBoolToObject(root, "scanning", ble_scanning());
+    cJSON_AddBoolToObject(root, "gated", ble_gated());
+    cJSON_AddNumberToObject(root, "count", n);
+    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        char addr[18];
+        mac_str(d[i].addr, addr);
+        cJSON_AddStringToObject(o, "addr", addr);
+        cJSON_AddStringToObject(o, "addr_type",
+                                ble_addr_type_name(d[i].addr_type));
+        cJSON_AddBoolToObject(o, "randomized", d[i].addr_type != 0);
+        cJSON_AddStringToObject(o, "name", d[i].name);
+        cJSON_AddNumberToObject(o, "rssi", d[i].rssi);
+        cJSON_AddNumberToObject(o, "count", d[i].count);
+        cJSON_AddStringToObject(o, "services", d[i].services);
+        cJSON_AddStringToObject(o, "beacon", d[i].beacon);
+        cJSON_AddNumberToObject(o, "first_seen_ms", d[i].first_seen_ms);
+        cJSON_AddNumberToObject(o, "last_seen_ms", d[i].last_seen_ms);
+        cJSON_AddStringToObject(o, "vendor",
+            d[i].addr_type == 0 ? pwn_oui_vendor(d[i].addr) : "randomized");
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(d);
+    return send_json(req, root);
+}
+
+static esp_err_t ble_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char buf[BODY_MAX];
+    cJSON *body = read_body(req, buf, sizeof(buf));
+    if (!body) {
+        return fail(req, "400 Bad Request", "invalid JSON");
+    }
+    cJSON *en = cJSON_GetObjectItem(body, "enabled");
+    if (!en) {
+        en = cJSON_GetObjectItem(body, "scan");
+    }
+    bool on = cJSON_IsTrue(en);
+    cJSON_Delete(body);
+
+    if (!ble_supported()) {
+        return fail(req, "503 Service Unavailable",
+                    "BLE scanner is not available in this build");
+    }
+    ble_set_enabled(on);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", true);
+    cJSON_AddBoolToObject(r, "supported", true);
+    cJSON_AddBoolToObject(r, "enabled", ble_enabled());
+    cJSON_AddBoolToObject(r, "scanning", ble_scanning());
+    cJSON_AddBoolToObject(r, "gated", ble_gated());
+    cJSON_AddStringToObject(r, "note",
+        "passive scan only; no connections or writes");
+    return send_json(req, r);
+}
+
+static esp_err_t dns_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    pwn_netmeta_counts_t nm;
+    netmeta_counts(&nm);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "total", nm.dns_total);
+    cJSON_AddNumberToObject(root, "count", nm.dns_count);
+    add_dns_array(root);
+    return send_json(req, root);
+}
+
+static esp_err_t sni_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    pwn_netmeta_counts_t nm;
+    netmeta_counts(&nm);
+    pwn_host_entry_t *h = big_calloc(PWN_HOST_MAX, sizeof(*h));
+    int n = h ? netmeta_sni_snapshot(h, PWN_HOST_MAX) : 0;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "total", nm.sni_total);
+    cJSON_AddNumberToObject(root, "count", nm.sni_count);
+    add_host_array(root, "hosts", h, n);
+    free(h);
+    return send_json(req, root);
+}
+
+static esp_err_t network_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    pwn_netmeta_counts_t nm;
+    netmeta_counts(&nm);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *counts = cJSON_AddObjectToObject(root, "counts");
+    cJSON_AddNumberToObject(counts, "dns_total", nm.dns_total);
+    cJSON_AddNumberToObject(counts, "dns", nm.dns_count);
+    cJSON_AddNumberToObject(counts, "sni_total", nm.sni_total);
+    cJSON_AddNumberToObject(counts, "sni", nm.sni_count);
+    cJSON_AddNumberToObject(counts, "http_total", nm.http_total);
+    cJSON_AddNumberToObject(counts, "http", nm.http_count);
+    cJSON_AddNumberToObject(counts, "talkers", nm.talker_count);
+    add_dns_array(root);
+    pwn_host_entry_t *h = big_calloc(PWN_HOST_MAX, sizeof(*h));
+    int n = h ? netmeta_sni_snapshot(h, PWN_HOST_MAX) : 0;
+    add_host_array(root, "sni", h, n);
+    n = h ? netmeta_http_snapshot(h, PWN_HOST_MAX) : 0;
+    add_host_array(root, "http", h, n);
+    free(h);
+    add_talker_array(root);
+    return send_json(req, root);
+}
+
+static void add_watch_fields(cJSON *root)
+{
+    int count = 0;
+    uint32_t hits = 0;
+    uint32_t age = 0;
+    char last[96] = "";
+    watch_status(&count, &hits, last, sizeof(last), &age);
+    cJSON_AddNumberToObject(root, "count", count);
+    cJSON_AddNumberToObject(root, "hits", hits);
+    cJSON_AddStringToObject(root, "last", last);
+    cJSON_AddNumberToObject(root, "age_ms", age);
+    cJSON_AddNumberToObject(root, "max", PWN_WATCH_MAX);
+    pwn_watch_item_t *items = big_calloc(PWN_WATCH_MAX, sizeof(*items));
+    int n = items ? watch_snapshot(items, PWN_WATCH_MAX) : 0;
+    cJSON *arr = cJSON_AddArrayToObject(root, "items");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "type", watch_type_name(items[i].type));
+        cJSON_AddStringToObject(o, "value", items[i].value);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(items);
+}
+
+static esp_err_t watch_get(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_CreateObject();
+    add_watch_fields(root);
+    return send_json(req, root);
+}
+
+static esp_err_t watch_post(httpd_req_t *req)
+{
+    if (!web_auth(req)) {
+        return ESP_OK;
+    }
+    char buf[BODY_MAX];
+    cJSON *body = read_body(req, buf, sizeof(buf));
+    if (!body) {
+        return fail(req, "400 Bad Request", "invalid JSON");
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItem(body, "clear"))) {
+        int removed = watch_clear();
+        cJSON_Delete(body);
+        cJSON *r = cJSON_CreateObject();
+        add_watch_fields(r);
+        cJSON_AddNumberToObject(r, "removed", removed);
+        return send_json(req, r);
+    }
+
+    const char *action = cJSON_GetStringValue(
+        cJSON_GetObjectItem(body, "action"));
+    const char *type = cJSON_GetStringValue(cJSON_GetObjectItem(body, "type"));
+    const char *value = cJSON_GetStringValue(cJSON_GetObjectItem(body, "value"));
+    if (!action || !type || !value) {
+        cJSON_Delete(body);
+        return fail(req, "400 Bad Request", "action, type and value are required");
+    }
+
+    if (strcasecmp(action, "add") == 0) {
+        char err[96];
+        esp_err_t e = watch_add(type, value, err, sizeof(err));
+        cJSON_Delete(body);
+        if (e != ESP_OK) {
+            const char *status = "400 Bad Request";
+            if (e == ESP_ERR_INVALID_STATE) {
+                status = "409 Conflict";
+            } else if (e == ESP_ERR_NO_MEM) {
+                status = "409 Conflict";
+            }
+            return fail(req, status, err[0] ? err : esp_err_to_name(e));
+        }
+    } else if (strcasecmp(action, "remove") == 0) {
+        bool ok = watch_remove(type, value);
+        cJSON_Delete(body);
+        if (!ok) {
+            return fail(req, "404 Not Found", "watch entry not found");
+        }
+    } else {
+        cJSON_Delete(body);
+        return fail(req, "400 Bad Request", "action must be add, remove or clear");
+    }
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", true);
+    add_watch_fields(r);
+    return send_json(req, r);
 }
 
 static esp_err_t hs_get(httpd_req_t *req)
@@ -730,7 +1065,7 @@ static esp_err_t deauth_post(httpd_req_t *req)
     if (duration_ms > 0) {
         int targets = have_sta ? 1 : 0;
         if (all && !have_sta) {
-            pwn_client_t *cl = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
+            pwn_client_t *cl = big_calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
             int cn = cl ? pwn_wifi_client_snapshot(cl, PWN_MAX_CLIENTS) : 0;
             for (int i = 0; i < cn; i++) {
                 if (memcmp(cl[i].bssid, bssid, 6) == 0 &&
@@ -802,7 +1137,7 @@ static esp_err_t deauth_post(httpd_req_t *req)
             }
         }
     } else if (all) {
-        pwn_client_t *cl = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
+        pwn_client_t *cl = big_calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
         int cn = cl ? pwn_wifi_client_snapshot(cl, PWN_MAX_CLIENTS) : 0;
         for (int i = 0; i < cn; i++) {
             if (memcmp(cl[i].bssid, bssid, 6) != 0) {
@@ -2151,7 +2486,7 @@ esp_err_t web_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
-    cfg.max_uri_handlers = 32;
+    cfg.max_uri_handlers = 48;
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;
@@ -2168,6 +2503,13 @@ esp_err_t web_start(void)
         {.uri = "/api/status",       .method = HTTP_GET,  .handler = status_get},
         {.uri = "/api/aps",          .method = HTTP_GET,  .handler = aps_get},
         {.uri = "/api/clients",      .method = HTTP_GET,  .handler = clients_get},
+        {.uri = "/api/ble",          .method = HTTP_GET,  .handler = ble_get},
+        {.uri = "/api/ble",          .method = HTTP_POST, .handler = ble_post},
+        {.uri = "/api/dns",          .method = HTTP_GET,  .handler = dns_get},
+        {.uri = "/api/sni",          .method = HTTP_GET,  .handler = sni_get},
+        {.uri = "/api/network",      .method = HTTP_GET,  .handler = network_get},
+        {.uri = "/api/watch",        .method = HTTP_GET,  .handler = watch_get},
+        {.uri = "/api/watch",        .method = HTTP_POST, .handler = watch_post},
         {.uri = "/api/hs",           .method = HTTP_GET,  .handler = hs_get},
         {.uri = "/api/sd",           .method = HTTP_POST, .handler = sd_post},
         {.uri = "/api/pcap",         .method = HTTP_GET,  .handler = pcap_get},

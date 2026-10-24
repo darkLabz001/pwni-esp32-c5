@@ -37,8 +37,12 @@ typedef struct {
     uint8_t  mac[6];
     uint8_t  bssid[6];
     int8_t   rssi;
+    uint8_t  randomized;
+    uint8_t  probe_count;
     uint32_t frames;
+    uint32_t first_seen_ms;
     uint32_t last_seen_ms;
+    char     probes[4][33];
 } pwn_client_t;
 
 typedef struct {
@@ -114,6 +118,10 @@ void pwn_wifi_last_tx(pwn_wifi_tx_t *out);
 void pwn_wifi_clear_last_tx(void);
 
 const pwn_wifi_stats_t *pwn_wifi_stats(void);
+
+/* Set the shared last-event string. Used by the sniffer itself and by the
+ * passive BLE/watch modules so /api/status shows one timeline. */
+void pwn_wifi_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int pwn_wifi_ap_snapshot(pwn_ap_t *out, int max);
 /* Copy one AP by BSSID without allocating a full snapshot. */
 bool pwn_wifi_ap_get(const uint8_t *bssid, pwn_ap_t *out);

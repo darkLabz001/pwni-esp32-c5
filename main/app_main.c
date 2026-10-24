@@ -16,6 +16,9 @@
 #include "pwn_cli.h"
 #include "pwn_net.h"
 #include "pwn_web.h"
+#include "pwn_watch.h"
+#include "pwn_netmeta.h"
+#include "pwn_ble.h"
 
 static const char *TAG = "pwni";
 
@@ -35,6 +38,8 @@ void app_main(void)
     ESP_LOGI(TAG, "passive-first sniffer, active attacks runtime gated");
 
     nvs_bringup();
+    watch_init();
+    netmeta_init();
 
     /* The CH32V003 IO expander owns LCD/touch reset and backlight PWM and
      * must be initialised before the panel or the FT6336 will not ACK. */
@@ -57,6 +62,9 @@ void app_main(void)
 
     net_init();
     web_start();
+    /* BLE is initialised last: it is opt-in, shares the 2.4 GHz radio, and
+     * must not delay display/Wi-Fi bring-up. */
+    ble_init();
 
     pet_init();
     if (disp) {

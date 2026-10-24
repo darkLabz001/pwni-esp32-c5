@@ -26,7 +26,8 @@ app_main ──► pet_tick() every 100 ms ──► pwn_pet (moods, reward, bra
 | Task | Where | Role |
 |---|---|---|
 | `app_main` | `main/app_main.c` | Bring-up, then `pet_tick()` every 100 ms |
-| `recon` | `main/pwn_wifi.c` | Ring-buffer receive, 802.11 parsing, table updates, EAPOL/PMKID handoff, hopping, scan |
+| `recon` | `main/pwn_wifi.c` | Ring-buffer receive, 802.11 parsing, table updates, passive DNS/SNI/HTTP parsing, watchlist rescan, EAPOL/PMKID handoff, hopping, scan |
+| `pwn_ble` | `main/pwn_ble.c` | NimBLE host task + supervisor; passive advertisements and watch matches |
 | LVGL task | `esp_lvgl_adapter` | Rendering; the UI timer runs inside the LVGL context |
 | HTTP server | `main/pwn_web.c` | `esp_http_server` on port 80, 8 KiB stack, 4 open sockets |
 | CLI | `main/pwn_cli.c` | USB-Serial/JTAG line input, 16 KiB stack (large enough to snapshot UI state) |
@@ -46,7 +47,9 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 
 - `esp_wifi` runs in STA mode. The promiscuous RX callback copies frames into a 48 KiB ring buffer; the recon task does the parsing.
 - Parses beacons/probe requests/probe responses, deauth/disassoc, QoS/data headers, LLC/SNAP, and EAPOL-Key.
-- Maintains fixed AP and client tables. Client insertion ignores group/multicast MAC addresses, so broadcast/multicast destinations do not appear as stations.
+- Maintains fixed AP and client tables in PSRAM. Client insertion ignores group/multicast MAC addresses, so broadcast/multicast destinations do not appear as stations. Clients keep `first_seen_ms`, `last_seen_ms`, a locally-administered/randomized flag, and the last four unique probe-request SSIDs.
+- Passive metadata parser (`pwn_netmeta`) receives unprotected data frame bodies from the same recon task: DNS questions (UDP/53), TLS ClientHello SNI (TCP/443, 8443, 993, 995, 465), HTTP `Host` headers (TCP/80, 8000, 8080, 8888), and per-source-MAC talker counters. Protected frames still contribute talker header metadata but no payload parsing. Names/counters are bounded; payloads are discarded immediately.
+- The watchlist is re-evaluated against the live AP/client tables every 2 s, so an entry added after a device was first seen still alerts.
 - Channel hopping follows the active policy. `esp_wifi_set_channel()` is used with a band-switch fallback for 5 GHz.
 - While associated, the station owns the radio. `pwn_wifi_set_locked(true, channel)` records the AP channel in the stats and stops hopping; a failed `set_channel()` is expected in that state and does not invalidate the lock.
 - `pwn_wifi_force_channel()` is used for manual parking and deauth targeting. It is rejected while associated (single radio).
@@ -81,11 +84,31 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - The web UI and the on-device `SET` screen both use this API.
 - The station connection state is exposed through `pwn_net_status_t` (connected, IP, netmask, gateway, RSSI, channel, BSSID, reason).
 
+### `pwn_watch` — persistent watchlist
+
+- NVS namespace `pwnwatch`, one blob key `items`, up to `PWN_WATCH_MAX` (24) records. Types: `ssid`, `mac`, `ble` (BLE address or advertised name).
+- Matching is passive and bounded. A per-entry 60 s cooldown prevents a beaconing AP or chatty BLE device from flooding the event log.
+- A match increments `watch_hits`, stores `watch_last`, and calls the shared `pwn_wifi_event()` so `/api/status`'s `last_event` reflects it for 60 s. The web header badge and optional toast read the same counters.
+
+### `pwn_netmeta` — DNS/SNI/HTTP metadata
+
+- Fixed tables: `PWN_DNS_MAX`, `PWN_HOST_MAX` (separate SNI/HTTP tables), and `PWN_TALKER_MAX`. Each entry stores a name/host or MAC/IP plus counts and uptime timestamps. LRU replacement keeps memory bounded.
+- DNS: parses only the question section, handles compression pointers defensively, and ignores responses. SNI: bounds-checked TLS record/handshake/extension walk. HTTP: request methods only, extracts `Host`, strips a non-IPv6 port. No query answers, URLs, cookies, or bodies are retained.
+- IPv4 only; WPA/WPA2/WPA3 data frames are encrypted and therefore not visible. The parser is bounds-checked and is validated with synthetic DNS/SNI/HTTP frames that exercise name compression, SNI extension walking, Host parsing, and talker accounting.
+
+### `pwn_ble` — passive NimBLE observer
+
+- Built with the NimBLE observer role only (no central/peripheral/broadcaster, GATT, pairing, or NVS persistence). `nimble_port_freertos_init()` owns the host task; a 1 s supervisor starts/stops scanning.
+- Scan parameters are passive with a low duty cycle (100 ms interval / 40 ms window) and duplicate filtering off for fresh RSSI. `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` keeps Wi-Fi first on the shared 2.4 GHz radio.
+- Runtime opt-in, off after every boot. Scanning is gated off while the setup AP is active or a deauth burst is in flight. No connection, scan-request, or write API is called.
+- Parses address/address type, name, RSSI, 16/32/128-bit service UUIDs, and common beacon formats (iBeacon, Eddystone, AltBeacon, Exposure Notification, Fast Pair, URI). The device table lives in PSRAM and is LRU-bounded.
+
 ### `pwn_web` — dashboard and JSON API
 
-- `esp_http_server` on port 80; 27 registered handlers; 4 open sockets; LRU purge enabled.
-- The root page is embedded from `pwn_web_page.h` (about 31 KB) and uses a dark dashboard with tabs: Dash, Nets, Clients, Caps, Attack, Set.
-- Read APIs snapshot the pet/wifi/capture tables into `cJSON` documents. `/api/hs` also scans `/sdcard/handshakes` for saved PCAPs, so the dashboard's archive survives reboots.
+- `esp_http_server` on port 80; 34 registered handlers; 4 open sockets; LRU purge enabled.
+- The root page is embedded from `pwn_web_page.h` (about 44 KB) and uses a dark dashboard with tabs: Dash, Nets, Clients, BLE, Net intel, Caps, Attack, Set.
+- Read APIs snapshot the pet/wifi/capture/BLE/netmeta tables into `cJSON` documents. `/api/hs` also scans `/sdcard/handshakes` for saved PCAPs, so the dashboard's archive survives reboots.
+- Recon APIs: `/api/ble`, `/api/dns`, `/api/sni`, `/api/network`, and `/api/watch`. `/api/clients` adds `vendor`, `randomized`, `probes`, `first_seen_ms`, and `last_seen_ms`. `/api/status` adds passive counters, BLE state, internal-heap diagnostics, and watch fields.
 - Control APIs call `pwn_net`, `pwn_wifi`, `pwn_hunt`, `pwn_pet`, and `bsp_display_brightness_set`.
 - PCAP download validates the requested basename with `safe_name()`, opens the file under the SD bus lock, and streams it with `Content-Disposition: attachment`.
 - Active-attack endpoints check `pwn_wifi_authorized()` and return `403` while locked. `/api/hunt` starts/stops the capture hunt and `/api/status` reports its state. Channel-changing endpoints return `409 Conflict` while associated.
@@ -130,9 +153,10 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 
 - Sniffer ring buffer: `PWN_RB_BYTES` = 48 KiB.
 - Handshake slots: heap-allocated, up to roughly 75 KiB with `PWN_FRAME_MAX=512`; intended for PSRAM.
-- AP table: `PWN_MAX_APS` (96) entries; client table: `PWN_MAX_CLIENTS` (128) entries; handshake table: `PWN_MAX_HS` (24).
+- AP table: `PWN_MAX_APS` (96) entries; client table: `PWN_MAX_CLIENTS` (128) entries; handshake table: `PWN_MAX_HS` (24). AP/client/BLE tables and large UI/web snapshots are allocated in PSRAM; this keeps enough internal SRAM for the NimBLE host/controller, Wi-Fi, TLS, HTTP, and task stacks. Measured idle internal-heap headroom with BLE available but not scanning is about 48–50 KiB, with a similar minimum.
+- Passive recon tables: DNS 24 × 80 B, SNI/HTTP 24 × 80 B each, talkers 16 entries, BLE 48 devices, watchlist 24 entries. Bounds are compile-time constants.
 - LVGL draw buffers and UI snapshot buffers live in PSRAM.
-- Task stacks: CLI 16 KiB, HTTP server 8 KiB, LVGL draw thread 8 KiB, main task 8 KiB.
+- Task stacks: CLI 16 KiB, HTTP server 8 KiB, LVGL draw thread 8 KiB, main task 8 KiB, NimBLE host 4 KiB, BLE supervisor 3 KiB.
 
 ## Build configuration
 
@@ -141,4 +165,5 @@ The CLI stack was raised from 5 KiB to **16 KiB** because snapshotting the setti
 - LVGL 9, RGB565, Montserrat 12/14/16/20/24/28 and UNSCII 8/16 fonts.
 - USB-Serial/JTAG console (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, UART console off).
 - FATFS long filenames, Wi-Fi RX/TX buffer tuning, HTTP server limits (`CONFIG_LWIP_MAX_SOCKETS=10`, 1024-byte request headers, 512-byte URI).
+- NimBLE observer only: Bluetooth enabled, NimBLE host, observer role, internal memory allocation, no central/peripheral/broadcaster/security/GATT/extended advertising. BLE scanning is a runtime opt-in and defaults off.
 - `PWN_ENABLE_DEAUTH` defaults to `1`, but active transmissions require the runtime phrase; `PWN_AUTH_PHRASE` is `ADMIN` and matching is case-insensitive. Auto-deauth defaults to off. Setting `PWN_ENABLE_DEAUTH` to `0` removes the active path entirely. Active deauth on the C5 also needs the local `libnet80211.a` patch; see [C5_DEAUTH.md](C5_DEAUTH.md). Stock IDF returns `ESP_ERR_INVALID_ARG`.

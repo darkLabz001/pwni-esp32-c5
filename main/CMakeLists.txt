@@ -7,6 +7,10 @@ idf_component_register(
         "pwn_wifi.c"
         "pwn_net.c"
         "pwn_web.c"
+        "pwn_watch.c"
+        "pwn_netmeta.c"
+        "pwn_ble.c"
+        "pwn_oui.c"
         "pwn_pet.c"
         "pwn_ui.c"
         "pwn_cli.c"
@@ -28,4 +32,6 @@ idf_component_register(
         json
         lvgl
         fatfs
+        bt
+        esp_coex
 )

@@ -323,7 +323,7 @@ static void epoch_end(void)
      * force a fresh 4-way handshake. Runtime-authorized builds only. */
     if (pwn_wifi_authorized() && pwn_wifi_auto_deauth() &&
         brain_policy(s_pet.action)->aggressive) {
-        pwn_client_t clients[16];
+        static pwn_client_t clients[16];
         int cn = pwn_wifi_client_snapshot(clients, 16);
         int sent = 0;
         for (int i = 0; i < cn && sent < 3; i++) {

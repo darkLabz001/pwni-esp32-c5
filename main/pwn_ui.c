@@ -60,7 +60,7 @@ static uint32_t s_tick;
 static pwn_mood_t s_last_mood;
 
 /* scan */
-static pwn_ap_t s_ui_aps[PWN_MAX_APS];
+static pwn_ap_t *s_ui_aps;
 static int s_ui_ap_count;
 static lv_obj_t *s_scan_list, *s_scan_hint;
 static volatile bool s_scan_running, s_scan_done;
@@ -99,7 +99,7 @@ static lv_obj_t *s_ta;
 static char s_kb_ssid[33];
 static int s_kb_mode_kind;   /* 0 = connect, 1 = auth */
 static pwn_ap_t s_sel_ap;
-static pwn_client_t s_ui_clients[PWN_MAX_CLIENTS];
+static pwn_client_t *s_ui_clients;
 static int s_ui_client_count;
 static lv_obj_t *s_toast, *s_toast_lbl;
 static uint32_t s_toast_until;
@@ -727,8 +727,12 @@ static void ap_deauth_cb(lv_event_t *e)
     bool self_ap = n.connected && memcmp(n.bssid, s_sel_ap.bssid, 6) == 0;
     uint8_t self[6];
     pwn_wifi_self_mac(self);
-    pwn_client_t cl[PWN_MAX_CLIENTS];
-    int cn = pwn_wifi_client_snapshot(cl, PWN_MAX_CLIENTS);
+    pwn_client_t *cl = heap_caps_calloc(PWN_MAX_CLIENTS, sizeof(*cl),
+                                        MALLOC_CAP_SPIRAM);
+    if (!cl) {
+        cl = calloc(PWN_MAX_CLIENTS, sizeof(*cl));
+    }
+    int cn = cl ? pwn_wifi_client_snapshot(cl, PWN_MAX_CLIENTS) : 0;
     int targets = 0;
     for (int i = 0; i < cn; i++) {
         if (memcmp(cl[i].bssid, s_sel_ap.bssid, 6) == 0 &&
@@ -737,9 +741,11 @@ static void ap_deauth_cb(lv_event_t *e)
         }
     }
     if (targets == 0 && self_ap) {
+        free(cl);
         toastf("no other clients seen");
         return;
     }
+    free(cl);
 
     pwn_deauth_job_t job = {0};
     memcpy(job.bssid, s_sel_ap.bssid, 6);
@@ -796,14 +802,19 @@ static void clients_btn_cb(lv_event_t *e)
     close_modal();
     uint8_t self[6];
     pwn_wifi_self_mac(self);
-    pwn_client_t all[PWN_MAX_CLIENTS];
-    int n = pwn_wifi_client_snapshot(all, PWN_MAX_CLIENTS);
+    pwn_client_t *all = heap_caps_calloc(PWN_MAX_CLIENTS, sizeof(*all),
+                                         MALLOC_CAP_SPIRAM);
+    if (!all) {
+        all = calloc(PWN_MAX_CLIENTS, sizeof(*all));
+    }
+    int n = all ? pwn_wifi_client_snapshot(all, PWN_MAX_CLIENTS) : 0;
     s_ui_client_count = 0;
     for (int i = 0; i < n && s_ui_client_count < PWN_MAX_CLIENTS; i++) {
         if (memcmp(all[i].bssid, s_sel_ap.bssid, 6) != 0) continue;
         if (memcmp(all[i].mac, self, 6) == 0) continue;
         s_ui_clients[s_ui_client_count++] = all[i];
     }
+    free(all);
 
     s_modal = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(s_modal);
@@ -1604,6 +1615,27 @@ static void ui_timer_cb(lv_timer_t *t)
 
 void ui_init(void)
 {
+    /* The AP/client snapshots are large (beacon context + probe history).
+     * Keep them in PSRAM so internal SRAM stays available for Wi-Fi/BLE/TLS
+     * stacks and task stacks. */
+    s_ui_aps = heap_caps_calloc(PWN_MAX_APS, sizeof(*s_ui_aps),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_ui_clients = heap_caps_calloc(PWN_MAX_CLIENTS, sizeof(*s_ui_clients),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_ui_aps) {
+        s_ui_aps = calloc(PWN_MAX_APS, sizeof(*s_ui_aps));
+    }
+    if (!s_ui_clients) {
+        s_ui_clients = calloc(PWN_MAX_CLIENTS, sizeof(*s_ui_clients));
+    }
+    if (!s_ui_aps || !s_ui_clients) {
+        ESP_LOGE(TAG, "snapshot allocation failed; UI disabled");
+        free(s_ui_aps);
+        free(s_ui_clients);
+        s_ui_aps = NULL;
+        s_ui_clients = NULL;
+        return;
+    }
     timeout_load();
 
     if (bsp_display_lock(1000) != ESP_OK) {

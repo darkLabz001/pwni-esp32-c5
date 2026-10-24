@@ -101,12 +101,16 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
   <span id="dot" class="dot"></span>
   <span id="hstate" class="ip">booting</span>
   <span class="spacer"></span>
+  <span id="watchBadge" class="tag bad" style="display:none;cursor:pointer"
+    title="watchlist match">WATCH 0</span>
   <span class="ip" id="hip">--</span>
 </header>
 <nav>
   <button data-tab="dash" class="active">Dashboard</button>
   <button data-tab="nets">Networks</button>
   <button data-tab="clients">Clients</button>
+  <button data-tab="ble">BLE</button>
+  <button data-tab="intel">Net intel</button>
   <button data-tab="caps">Captures</button>
   <button data-tab="attack">Attacks</button>
   <button data-tab="set">Settings</button>
@@ -136,6 +140,8 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
       <div class="sub" id="band">--</div></div>
     <div class="card"><h3>Strategy</h3><div class="big" id="action" style="font-size:19px">--</div>
       <div class="sub" id="locked">--</div></div>
+    <div class="card"><h3>BLE devices</h3><div class="big" id="bleCount">0</div>
+      <div class="sub" id="bleSub">off</div></div>
   </div>
   <div class="panel">
     <h2>Live</h2>
@@ -172,9 +178,97 @@ footer{color:#39503c;font-size:11px;text-align:center;padding:26px 10px}
 
 <section id="clients">
   <div class="panel">
+    <h2>Watchlist</h2>
+    <div class="row">
+      <div style="flex:0 0 140px"><label>Type</label><select id="watchType">
+        <option value="ssid">SSID</option>
+        <option value="mac">Wi-Fi MAC</option>
+        <option value="ble">BLE address / name</option>
+      </select></div>
+      <div><label>Value</label><input id="watchValue" maxlength="32"
+        placeholder="SSID, aa:bb:cc:dd:ee:ff, or BLE name" autocomplete="off"></div>
+      <button class="act fit" id="bWatchAdd" style="align-self:end">Watch</button>
+      <button class="act danger fit" id="bWatchClear" style="align-self:end">Clear</button>
+    </div>
+    <table style="margin-top:12px"><thead><tr><th>Type</th><th>Value</th><th></th></tr></thead>
+      <tbody id="watchRows"><tr><td colspan="3" class="sub">no watched entries</td></tr></tbody></table>
+    <div id="watchState" class="hint">No watchlist matches yet. Alerts are local only.</div>
+  </div>
+  <div class="panel">
     <h2>Observed clients</h2>
-    <table><thead><tr><th>Station</th><th>BSSID</th><th>RSSI</th><th>Frames</th><th></th></tr></thead>
-      <tbody id="cliRows"><tr><td colspan="5" class="sub">waiting...</td></tr></tbody></table>
+    <div style="overflow:auto">
+    <table><thead><tr><th>Station</th><th>Vendor</th><th>BSSID</th><th>RSSI</th>
+      <th>Frames</th><th>Probes</th><th>First / last</th><th></th></tr></thead>
+      <tbody id="cliRows"><tr><td colspan="8" class="sub">waiting...</td></tr></tbody></table>
+    </div>
+    <div class="hint">MAC randomization is inferred from the locally administered
+    bit; vendor labels come from a small built-in OUI table. Probe history is
+    limited to the last few unique SSIDs.</div>
+  </div>
+</section>
+
+<section id="ble">
+  <div class="panel">
+    <div class="row" style="align-items:center">
+      <h2 style="margin:0">BLE scanner</h2>
+      <span id="bleTag" class="tag">off</span>
+      <span class="spacer"></span>
+      <label class="sw" style="margin:0"><input type="checkbox" id="bleOn"><span class="sl"></span></label>
+    </div>
+    <div id="bleState" class="sub" style="margin-top:10px">scanner off</div>
+    <div class="hint">Passive observer only: the firmware never connects, pairs,
+    writes, or sends scan requests. It is off by default and pauses while the
+    setup AP or a deauth burst is active. Wi-Fi keeps coexistence priority.</div>
+  </div>
+  <div class="panel">
+    <h2>Recent BLE devices</h2>
+    <div style="overflow:auto">
+    <table><thead><tr><th>Address</th><th>Type</th><th>Name</th><th>RSSI</th>
+      <th>Services / beacon</th><th>Count</th><th>Last</th></tr></thead>
+      <tbody id="bleRows"><tr><td colspan="7" class="sub">scanner off</td></tr></tbody></table>
+    </div>
+    <div class="hint">Names are only available when the advertiser includes them;
+    passive scans do not request scan responses.</div>
+  </div>
+</section>
+
+<section id="intel">
+  <div class="grid">
+    <div class="card"><h3>DNS queries</h3><div class="big" id="iDns">0</div>
+      <div class="sub">unique names</div></div>
+    <div class="card"><h3>SNI hosts</h3><div class="big" id="iSni">0</div>
+      <div class="sub">TLS ClientHello</div></div>
+    <div class="card"><h3>HTTP hosts</h3><div class="big" id="iHttp">0</div>
+      <div class="sub">Host headers</div></div>
+    <div class="card"><h3>Top talkers</h3><div class="big" id="iTalkers">0</div>
+      <div class="sub">source MACs</div></div>
+  </div>
+  <div class="panel">
+    <h2>Recent DNS queries</h2>
+    <table><thead><tr><th>Name</th><th>Type</th><th>Count</th><th>Last</th></tr></thead>
+      <tbody id="dnsRows"><tr><td colspan="4" class="sub">none yet</td></tr></tbody></table>
+  </div>
+  <div class="panel">
+    <h2>TLS SNI hosts</h2>
+    <table><thead><tr><th>Host</th><th>Count</th><th>Last</th></tr></thead>
+      <tbody id="sniRows"><tr><td colspan="3" class="sub">none yet</td></tr></tbody></table>
+  </div>
+  <div class="panel">
+    <h2>HTTP Host headers</h2>
+    <table><thead><tr><th>Host</th><th>Count</th><th>Last</th></tr></thead>
+      <tbody id="httpRows"><tr><td colspan="3" class="sub">none yet</td></tr></tbody></table>
+  </div>
+  <div class="panel">
+    <h2>Top talkers</h2>
+    <div style="overflow:auto">
+    <table><thead><tr><th>Source</th><th>Vendor</th><th>IP</th><th>Frames</th>
+      <th>Bytes</th><th>Last</th></tr></thead>
+      <tbody id="talkRows"><tr><td colspan="6" class="sub">none yet</td></tr></tbody></table>
+    </div>
+    <div class="hint">Only metadata is kept: DNS question names, TLS SNI, HTTP
+    Host, and per-source counters. Payloads, URLs, cookies, credentials, and
+    query answers are never stored. WPA/WPA2/WPA3 data frames are encrypted and
+    therefore invisible to this parser; results come from unprotected frames.</div>
   </div>
 </section>
 
@@ -321,6 +415,7 @@ const $ = s => document.querySelector(s);
 const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let S = {};
 let toastT;
+let lastWatchHits = null;
 function toast(m,bad){const t=$('#toast');t.textContent=m;t.style.borderColor=bad?'#ff6b6b':'#8cf58c';
 t.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('on'),2600)}
 function goUnlock(){document.querySelector('nav button[data-tab="attack"]').click();
@@ -332,6 +427,17 @@ body:JSON.stringify(body||{})})}
 const fmtUp = s => {s=Math.floor(s);const d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);
 s%=3600;const m=Math.floor(s/60);s%=60;return (d?d+'d ':'')+(h?h+'h ':'')+m+'m '+s+'s'}
 const fmtB = b => b>1048576?(b/1048576).toFixed(1)+' MB':b>1024?(b/1024).toFixed(0)+' KB':b+' B'
+const QT = {1:'A',2:'NS',5:'CNAME',6:'SOA',12:'PTR',15:'MX',16:'TXT',28:'AAAA',
+  33:'SRV',43:'DS',46:'RRSIG',64:'SVCB',65:'HTTPS',255:'ANY'}
+const qtype = q => QT[q]||('T'+q)
+function ago(ms){
+  if(!ms)return '-';
+  const s=Math.max(0,Math.floor((S.uptime||0)-ms/1000));
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m';
+  if(s<86400)return Math.floor(s/3600)+'h';
+  return Math.floor(s/86400)+'d';
+}
 function rssiBar(r){const pct=Math.max(0,Math.min(100,(r+100)*100/60));return '<span class="rssi-wrap"><span class="rssi"><i style="width:'+pct+'%"></i></span> '+r+'</span>'}
 
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
@@ -339,10 +445,25 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');$('#'+b.dataset.tab).classList.add('active');
   if(b.dataset.tab==='nets')loadNets();
-  if(b.dataset.tab==='clients')loadClients();
+  if(b.dataset.tab==='clients'){loadClients();loadWatch();}
+  if(b.dataset.tab==='ble')loadBle();
+  if(b.dataset.tab==='intel')loadIntel();
   if(b.dataset.tab==='caps')loadCaps();
   if(b.dataset.tab==='attack'){loadNets(true).then(loadHuntClients);$('#strategy').value=String(S.action_override??-1);}
 });
+$('#watchBadge').onclick=()=>document.querySelector('nav button[data-tab="clients"]').click();
+function renderWatchBadge(){
+  const n=S.watch_count||0,h=S.watch_hits||0,b=$('#watchBadge');
+  if(n>0){
+    b.style.display='inline-block';
+    b.className='tag '+(h?'bad':'warn');
+    b.textContent='WATCH '+n;
+    if(lastWatchHits!==null&&h>lastWatchHits)toast('watch: '+(S.watch_last||'match'),true);
+  }else{
+    b.style.display='none';
+  }
+  lastWatchHits=h;
+}
 function renderStatus(){
   const setup=!!(S.setup_mode||S.ap_active);
   const apUrl='http://'+((S.ap_ip&&S.ap_ip.length)?S.ap_ip:'192.168.4.1')+'/';
@@ -364,6 +485,10 @@ function renderStatus(){
   $('#frames').textContent=S.frames;$('#eapol').textContent=S.eapol;$('#deauth').textContent=S.deauths;
   $('#drop').textContent=S.dropped;$('#up').textContent=fmtUp(S.uptime);
   $('#event').textContent=S.last_event||'listening...';
+  $('#bleCount').textContent=S.ble_count||0;
+  $('#bleSub').textContent=!S.ble_supported?'not built':(S.ble_scanning?'scanning':
+    (S.ble_enabled?(S.ble_gated?'paused (coex)':'starting'):'off (opt-in)'));
+  renderWatchBadge();
   $('#bPause').textContent=S.paused?'Resume':'Pause';
   $('#bAuthState').textContent=S.authorized?'Attacks UNLOCKED':'Attacks locked';
   $('#authBox').innerHTML=S.authorized
@@ -437,13 +562,87 @@ async function loadNets(selectOnly){
 }
 async function loadClients(){
   const j=await api('/api/clients');let h='';
-  if(!j.clients.length)h='<tr><td colspan="5" class="sub">no clients seen</td></tr>';
-  j.clients.forEach(c=>{h+='<tr><td class="mono">'+c.mac+(c.self?' <span class="tag">this device</span>':'')+'</td><td class="mono">'+c.bssid+
-    '</td><td>'+rssiBar(c.rssi)+'</td><td>'+c.frames+'</td><td class="row" style="justify-content:flex-end">'+
+  if(!j.clients.length)h='<tr><td colspan="8" class="sub">no clients seen</td></tr>';
+  j.clients.forEach(c=>{
+    const probes=(c.probes||[]).map(p=>'<span class="tag">'+esc(p)+'</span>').join(' ')||'<span class="sub">-</span>';
+    h+='<tr><td class="mono">'+c.mac+(c.self?' <span class="tag">this device</span>':'')+'</td>'+
+    '<td>'+esc(c.vendor||'?')+(c.randomized?' <span class="tag warn">rand</span>':'')+'</td>'+
+    '<td class="mono">'+c.bssid+'</td><td>'+rssiBar(c.rssi)+'</td><td>'+c.frames+
+    '</td><td>'+probes+'</td><td class="sub">'+ago(c.first_seen_ms)+' / '+ago(c.last_seen_ms)+
+    '</td><td class="row" style="justify-content:flex-end">'+
     (c.self?'<span class="sub">protected</span>':
       (c.has_ap?'<button class="act danger" onclick="deauthClient(\''+c.bssid+'\',\''+c.mac+'\')">Deauth</button>':
        '<span class="sub">AP unknown</span>'))+'</td></tr>'});
   $('#cliRows').innerHTML=h;
+}
+async function loadWatch(){
+  const j=await api('/api/watch');let h='';
+  if(!j.items||!j.items.length)h='<tr><td colspan="3" class="sub">no watched entries</td></tr>';
+  (j.items||[]).forEach(w=>{
+    h+='<tr><td><span class="tag">'+esc(w.type)+'</span></td><td class="mono">'+esc(w.value)+
+    '</td><td class="row" style="justify-content:flex-end"><button class="act danger" onclick="removeWatch('+
+    JSON.stringify(w.type).replace(/"/g,'&quot;')+','+JSON.stringify(w.value).replace(/"/g,'&quot;')+
+    ')">Remove</button></td></tr>'});
+  $('#watchRows').innerHTML=h;
+  $('#watchState').textContent=(j.hits||0)+' alert(s)'+
+    (j.last?(' · last: '+j.last):'')+' · '+((j.count||0)+'/'+(j.max||0)+' used');
+}
+async function addWatch(){
+  const type=$('#watchType').value,value=$('#watchValue').value.trim();
+  if(!value)return toast('enter a value',true);
+  try{const j=await post('/api/watch',{action:'add',type:type,value:value});
+    $('#watchValue').value='';toast('watching '+value);loadWatch();poll();
+  }catch(e){}
+}
+async function removeWatch(type,value){
+  try{await post('/api/watch',{action:'remove',type:type,value:value});
+    toast('removed');loadWatch();poll();
+  }catch(e){}
+}
+async function loadBle(){
+  const j=await api('/api/ble');
+  $('#bleOn').checked=!!j.enabled;$('#bleOn').disabled=!j.supported;
+  $('#bleTag').className='tag '+(j.scanning?'good':(j.gated?'warn':''));
+  $('#bleTag').textContent=j.supported?(j.scanning?'scanning':(j.enabled?'paused':'off')):'not built';
+  $('#bleState').textContent=j.supported
+    ?((j.enabled?'requested on':'off by default')+(j.gated?' · paused while Wi-Fi AP/deauth owns the radio':'')+
+      ' · '+j.count+' device(s)'):'NimBLE is not available in this build';
+  let h='';
+  if(!j.devices||!j.devices.length)h='<tr><td colspan="7" class="sub">'+(j.enabled?'waiting for advertisements...':'scanner off')+'</td></tr>';
+  (j.devices||[]).slice().sort((a,b)=>(b.last_seen_ms||0)-(a.last_seen_ms||0)).forEach(d=>{
+    const extra=[esc(d.services||''),esc(d.beacon||'')].filter(x=>x).join(' · ');
+    h+='<tr><td class="mono">'+esc(d.addr)+'</td><td>'+esc(d.addr_type)+
+    (d.randomized?' <span class="tag warn">rand</span>':'')+'</td><td>'+esc(d.name||'-')+
+    '</td><td>'+rssiBar(d.rssi)+'</td><td>'+extra+'</td><td>'+d.count+
+    '</td><td class="sub">'+ago(d.last_seen_ms)+'</td></tr>'});
+  $('#bleRows').innerHTML=h;
+}
+async function loadIntel(){
+  const j=await api('/api/network');
+  const c=j.counts||{};
+  $('#iDns').textContent=c.dns||0;$('#iSni').textContent=c.sni||0;
+  $('#iHttp').textContent=c.http||0;$('#iTalkers').textContent=c.talkers||0;
+  let h='';
+  if(!j.dns||!j.dns.length)h='<tr><td colspan="4" class="sub">none yet</td></tr>';
+  (j.dns||[]).forEach(x=>{h+='<tr><td class="mono">'+esc(x.name)+'</td><td>'+qtype(x.qtype)+
+    '</td><td>'+x.count+'</td><td class="sub">'+ago(x.last_seen_ms)+'</td></tr>'});
+  $('#dnsRows').innerHTML=h;
+  h='';
+  if(!j.sni||!j.sni.length)h='<tr><td colspan="3" class="sub">none yet</td></tr>';
+  (j.sni||[]).forEach(x=>{h+='<tr><td class="mono">'+esc(x.host)+'</td><td>'+x.count+
+    '</td><td class="sub">'+ago(x.last_seen_ms)+'</td></tr>'});
+  $('#sniRows').innerHTML=h;
+  h='';
+  if(!j.http||!j.http.length)h='<tr><td colspan="3" class="sub">none yet</td></tr>';
+  (j.http||[]).forEach(x=>{h+='<tr><td class="mono">'+esc(x.host)+'</td><td>'+x.count+
+    '</td><td class="sub">'+ago(x.last_seen_ms)+'</td></tr>'});
+  $('#httpRows').innerHTML=h;
+  h='';
+  if(!j.talkers||!j.talkers.length)h='<tr><td colspan="6" class="sub">none yet</td></tr>';
+  (j.talkers||[]).forEach(x=>{h+='<tr><td class="mono">'+esc(x.mac)+'</td><td>'+esc(x.vendor||'?')+
+    '</td><td class="mono">'+esc(x.ip||'-')+'</td><td>'+x.frames+'</td><td>'+fmtB(x.bytes)+
+    '</td><td class="sub">'+ago(x.last_seen_ms)+'</td></tr>'});
+  $('#talkRows').innerHTML=h;
 }
 async function loadHuntClients(){
   const b=$('#targetAp').value;
@@ -511,6 +710,17 @@ async function deauthClient(bssid,mac){
   }catch(e){if(String(e.message).includes('unlock'))goUnlock()}
 }
 $('#bPause').onclick=async()=>{await post('/api/pause',{paused:!S.paused});poll()};
+$('#bWatchAdd').onclick=addWatch;
+$('#watchValue').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addWatch()}});
+$('#bWatchClear').onclick=async()=>{
+  if(!confirm('Clear the whole watchlist?'))return;
+  try{await post('/api/watch',{clear:true});toast('watchlist cleared');loadWatch();poll();}catch(e){}
+};
+$('#bleOn').onchange=async e=>{
+  try{const j=await post('/api/ble',{enabled:e.target.checked});
+    toast('BLE scanner '+(j.enabled?'enabled':'disabled'));loadBle();poll();
+  }catch(x){e.target.checked=!e.target.checked}
+};
 $('#bScan').onclick=$('#bScan2').onclick=async()=>{toast('scanning...');
   try{const j=await post('/api/scan',{});toast('found '+j.found+' APs');loadNets()}catch(e){}};
 $('#bAuthState').onclick=async()=>{goUnlock()};
@@ -600,6 +810,8 @@ setInterval(poll,2000);poll();
 setInterval(()=>{if(document.getElementById('nets').classList.contains('active'))loadNets()},7000);
 setInterval(()=>{if(document.getElementById('caps').classList.contains('active'))loadCaps()},5000);
 setInterval(()=>{if(document.getElementById('clients').classList.contains('active'))loadClients()},5000);
+setInterval(()=>{if(document.getElementById('ble').classList.contains('active'))loadBle()},4000);
+setInterval(()=>{if(document.getElementById('intel').classList.contains('active'))loadIntel()},5000);
 </script>
 </body>
 </html>

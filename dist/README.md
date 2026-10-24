@@ -19,3 +19,8 @@ With no saved credentials (or after 30 s of failed station joins) it starts an
 open `PWNI-Setup-XXXX` SoftAP at `http://192.168.4.1/` for dashboard-based
 provisioning; the AP stops after the station gets an IP. Only use active
 features on networks you own or are authorized to test.
+
+Version 0.3.4 adds passive BLE scanning (opt-in, off by default), DNS/SNI/HTTP
+Host visibility for unprotected frames, OUI/randomized-MAC client fingerprinting
+with probe history, and a persistent watchlist. All new recon features are
+receive-only; they never connect, inject, or decrypt traffic.

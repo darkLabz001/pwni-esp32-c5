@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 #include "esp_log.h"
@@ -18,6 +19,9 @@
 #include "freertos/queue.h"
 
 #include "pwn_capture.h"
+#include "pwn_watch.h"
+#include "pwn_netmeta.h"
+#include "pwn_oui.h"
 
 static const char *TAG = "wifi";
 
@@ -37,7 +41,7 @@ static SemaphoreHandle_t s_tab_lock;
 static SemaphoreHandle_t s_evt_lock;
 
 static pwn_ap_t    *s_aps;
-static pwn_client_t s_clients[PWN_MAX_CLIENTS];
+static pwn_client_t *s_clients;
 static pwn_wifi_stats_t s_stats;
 static pwn_wifi_tx_t s_last_tx;
 static QueueHandle_t s_deauth_q;
@@ -59,9 +63,9 @@ static volatile uint8_t s_chan_count = PWN_2G_COUNT;
 static volatile uint8_t s_chan_idx;
 static volatile uint32_t s_hop_errors;
 
-static void event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void pwn_wifi_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-static void event(const char *fmt, ...)
+void pwn_wifi_event(const char *fmt, ...)
 {
     char tmp[sizeof(s_stats.last_event)];
     va_list ap;
@@ -136,6 +140,9 @@ static pwn_client_t *client_upsert(const uint8_t *mac, const uint8_t *bssid)
             if (bssid && !s_clients[i].bssid[0] && !s_clients[i].bssid[1]) {
                 memcpy(s_clients[i].bssid, bssid, 6);
             }
+            if (!s_clients[i].first_seen_ms) {
+                s_clients[i].first_seen_ms = now_ms();
+            }
             return &s_clients[i];
         }
     }
@@ -157,9 +164,36 @@ static pwn_client_t *client_upsert(const uint8_t *mac, const uint8_t *bssid)
         if (bssid) {
             memcpy(c->bssid, bssid, 6);
         }
+        c->first_seen_ms = now_ms();
+        c->randomized = pwn_oui_randomized(mac) ? 1 : 0;
         s_stats.client_count++;
     }
     return c;
+}
+
+/* Keep the last few unique probe SSIDs per station. */
+static bool client_add_probe(pwn_client_t *c, const char *ssid)
+{
+    if (!c || !ssid || !ssid[0]) {
+        return false;
+    }
+    int limit = (int)(sizeof(c->probes) / sizeof(c->probes[0]));
+    for (int i = 0; i < c->probe_count && i < limit; i++) {
+        if (strcmp(c->probes[i], ssid) == 0) {
+            return false;
+        }
+    }
+    int slot;
+    if (c->probe_count < limit) {
+        slot = c->probe_count++;
+    } else {
+        for (int i = 1; i < limit; i++) {
+            memcpy(c->probes[i - 1], c->probes[i], sizeof(c->probes[0]));
+        }
+        slot = limit - 1;
+    }
+    snprintf(c->probes[slot], sizeof(c->probes[slot]), "%s", ssid);
+    return true;
 }
 
 static const char *ap_ssid_for(const uint8_t *bssid, char out[33])
@@ -319,10 +353,14 @@ static void handle_beacon(const uint8_t *p, int len, int8_t rssi, uint8_t phy_ch
     }
     bool wps = ies_has_wps(ies, ielen);
     bool pmf = (sec == SEC_WPA3) || ies_rsn_pmf(ies, ielen);
+    bool new_ap = false;
+    bool new_ssid = false;
 
     xSemaphoreTake(s_tab_lock, portMAX_DELAY);
     pwn_ap_t *ap = ap_upsert(bssid);
     if (ap) {
+        new_ap = (ap->beacons == 0);
+        new_ssid = !hidden && strcmp(ap->ssid, ssid) != 0;
         ap->rssi = rssi;
         ap->last_seen_ms = now_ms();
         ap->beacons++;
@@ -348,6 +386,13 @@ static void handle_beacon(const uint8_t *p, int len, int8_t rssi, uint8_t phy_ch
     }
     xSemaphoreGive(s_tab_lock);
 
+    if (new_ap) {
+        watch_check_mac(bssid);
+    }
+    if (!hidden && (new_ap || new_ssid)) {
+        watch_check_ssid(ssid);
+    }
+
     s_stats.beacons++;
 }
 
@@ -363,17 +408,28 @@ static void handle_probe_req(const uint8_t *p, int len, int8_t rssi)
     }
     s_stats.probes++;
 
+    bool new_client = false;
+    bool new_probe = false;
     xSemaphoreTake(s_tab_lock, portMAX_DELAY);
     pwn_client_t *c = (sta[0] & 0x01) == 0 ? client_upsert(sta, NULL) : NULL;
     if (c) {
+        new_client = (c->frames == 0);
         c->rssi = rssi;
         c->frames++;
         c->last_seen_ms = now_ms();
+        new_probe = client_add_probe(c, ssid);
     }
     xSemaphoreGive(s_tab_lock);
 
+    if (new_client) {
+        watch_check_mac(sta);
+    }
+    if (new_probe) {
+        watch_check_ssid(ssid);
+    }
+
     if (ssid[0]) {
-        event("probe %s from %02x:%02x:%02x:%02x:%02x:%02x", ssid,
+        pwn_wifi_event("probe %s from %02x:%02x:%02x:%02x:%02x:%02x", ssid,
               sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
     }
 }
@@ -485,11 +541,11 @@ static void handle_eapol(const uint8_t *p, int len, int hdr_len, int8_t rssi)
     capture_add_eapol(bssid, sta, ssid, msg, p, (uint16_t)len, pmkid,
                       ctx_ch, ctx_rssi, ctx_bcn, ctx_bcn_len);
 
-    event("EAPOL M%u %s %02x:%02x:%02x:%02x:%02x:%02x", msg, ssid,
+    pwn_wifi_event("EAPOL M%u %s %02x:%02x:%02x:%02x:%02x:%02x", msg, ssid,
           sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
 
     if (pmkid) {
-        event("PMKID leaked by %s (M%u)", ssid, msg);
+        pwn_wifi_event("PMKID leaked by %s (M%u)", ssid, msg);
     }
 
     (void)rssi;
@@ -524,18 +580,53 @@ static void handle_data(const uint8_t *p, int len, int8_t rssi)
         sta = p + 4;
     }
 
+    bool new_client = false;
     if (sta && bssid && (sta[0] & 0x01) == 0) {
         xSemaphoreTake(s_tab_lock, portMAX_DELAY);
         pwn_client_t *c = client_upsert(sta, bssid);
         if (c) {
+            new_client = (c->frames == 0);
             c->rssi = rssi;
             c->frames++;
             c->last_seen_ms = now_ms();
         }
         xSemaphoreGive(s_tab_lock);
     }
+    if (new_client) {
+        watch_check_mac(sta);
+    }
+
+    /* Metadata-only parser for unprotected frames: DNS/SNI/HTTP host and
+     * per-source talker counters. Full payloads are not stored. */
+    netmeta_process(p, len, hdr, (p[1] & 0x40) != 0);
 
     handle_eapol(p, len, hdr, rssi);
+}
+
+/* Re-evaluate the persistent watchlist against the live tables. Doing this
+ * periodically means a watch entry added after an AP/client was first seen
+ * still raises an alert without checking the list on every data frame. */
+static void watch_scan_tables(void)
+{
+    if (watch_count() == 0) {
+        return;
+    }
+    xSemaphoreTake(s_tab_lock, portMAX_DELAY);
+    for (int i = 0; i < PWN_MAX_APS; i++) {
+        if (!s_aps[i].last_seen_ms) {
+            continue;
+        }
+        watch_check_mac(s_aps[i].bssid);
+        if (s_aps[i].ssid[0]) {
+            watch_check_ssid(s_aps[i].ssid);
+        }
+    }
+    for (int i = 0; i < PWN_MAX_CLIENTS; i++) {
+        if (s_clients[i].last_seen_ms) {
+            watch_check_mac(s_clients[i].mac);
+        }
+    }
+    xSemaphoreGive(s_tab_lock);
 }
 
 static void process_frame(const uint8_t *p, int len, int8_t rssi, uint8_t phy_ch)
@@ -558,7 +649,7 @@ static void process_frame(const uint8_t *p, int len, int8_t rssi, uint8_t phy_ch
         } else if (sub == 12 || sub == 10) { /* deauth / disassoc */
             if (sub == 12) s_stats.deauths++;
             else           s_stats.disassoc++;
-            event("%s from %02x:%02x:%02x:%02x:%02x:%02x",
+            pwn_wifi_event("%s from %02x:%02x:%02x:%02x:%02x:%02x",
                   sub == 12 ? "deauth" : "disassoc",
                   p[10], p[11], p[12], p[13], p[14], p[15]);
         }
@@ -654,6 +745,12 @@ static void recon_task(void *arg)
             last_stat = now;
         }
 
+        static uint32_t last_watch;
+        if (now - last_watch >= 2000) {
+            watch_scan_tables();
+            last_watch = now;
+        }
+
         vTaskDelay(0);
     }
 }
@@ -684,6 +781,16 @@ esp_err_t pwn_wifi_start(void)
     }
     if (!s_aps) {
         ESP_LOGE(TAG, "AP table allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_clients = heap_caps_calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t),
+                                 MALLOC_CAP_SPIRAM);
+    if (!s_clients) {
+        s_clients = calloc(PWN_MAX_CLIENTS, sizeof(pwn_client_t));
+    }
+    if (!s_clients) {
+        ESP_LOGE(TAG, "client table allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -751,7 +858,7 @@ esp_err_t pwn_wifi_start(void)
 
     ESP_LOGI(TAG, "sniffer up: band=AUTO dwell=%ums plan=%uch",
              (unsigned)s_dwell_ms, s_chan_count);
-    event("sniffer up");
+    pwn_wifi_event("sniffer up");
     return ESP_OK;
 }
 
@@ -807,7 +914,7 @@ void pwn_wifi_apply_policy(const brain_policy_t *p, bool authorized)
 void pwn_wifi_set_paused(bool paused)
 {
     s_paused = paused;
-    event(paused ? "paused" : "resumed");
+    pwn_wifi_event(paused ? "paused" : "resumed");
 }
 
 bool pwn_wifi_paused(void)
@@ -986,7 +1093,16 @@ static void deauth_round(const pwn_deauth_job_t *job)
         return;
     }
 
-    pwn_client_t cl[PWN_MAX_CLIENTS];
+    static pwn_client_t *cl;
+    if (!cl) {
+        cl = heap_caps_calloc(PWN_MAX_CLIENTS, sizeof(*cl), MALLOC_CAP_SPIRAM);
+        if (!cl) {
+            cl = calloc(PWN_MAX_CLIENTS, sizeof(*cl));
+        }
+        if (!cl) {
+            return;
+        }
+    }
     int cn = pwn_wifi_client_snapshot(cl, PWN_MAX_CLIENTS);
     uint8_t self[6];
     pwn_wifi_self_mac(self);
@@ -1092,7 +1208,7 @@ esp_err_t pwn_wifi_force_channel(uint8_t channel)
         s_chan_idx = 0;
         s_stats.channel = channel;
         s_stats.band = channel >= 36 ? 5 : 2;
-        event("manual channel %u", channel);
+        pwn_wifi_event("manual channel %u", channel);
     }
     return err;
 }
@@ -1115,12 +1231,12 @@ void pwn_wifi_set_locked(bool locked, uint8_t channel)
              */
             s_stats.channel = channel;
             s_stats.band = channel >= 36 ? 5 : 2;
-            event("locked to AP channel %u", channel);
+            pwn_wifi_event("locked to AP channel %u", channel);
         }
     } else if (s_locked) {
         s_locked = false;
         s_chan_idx = 0;
-        event(s_ap_active ? "AP keeps channel" : "hopping resumed");
+        pwn_wifi_event(s_ap_active ? "AP keeps channel" : "hopping resumed");
     }
 }
 
@@ -1183,7 +1299,7 @@ esp_err_t pwn_wifi_set_ap(bool on, const char *ssid)
         s_stats.band = PWN_SETUP_AP_CHANNEL >= 36 ? 5 : 2;
         ESP_LOGI(TAG, "setup AP up: %s ch %u (open)",
                  ssid, (unsigned)PWN_SETUP_AP_CHANNEL);
-        event("setup AP %s", ssid);
+        pwn_wifi_event("setup AP %s", ssid);
         return ESP_OK;
     }
 
@@ -1199,10 +1315,10 @@ esp_err_t pwn_wifi_set_ap(bool on, const char *ssid)
     sniffer_enable();
     if (!s_locked) {
         s_chan_idx = 0;
-        event("setup AP stopped");
+        pwn_wifi_event("setup AP stopped");
         ESP_LOGI(TAG, "setup AP stopped; hopping resumed");
     } else {
-        event("setup AP stopped, STA locked");
+        pwn_wifi_event("setup AP stopped, STA locked");
         ESP_LOGI(TAG, "setup AP stopped; station keeps the channel");
     }
     return ESP_OK;
@@ -1421,6 +1537,6 @@ int pwn_wifi_scan_now(void)
         s_stats.channel = PWN_SETUP_AP_CHANNEL;
         s_stats.band = PWN_SETUP_AP_CHANNEL >= 36 ? 5 : 2;
     }
-    event("scan found %u APs", got);
+    pwn_wifi_event("scan found %u APs", got);
     return got;
 }

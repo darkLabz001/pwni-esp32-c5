@@ -19,7 +19,11 @@
 - **Touch UI** — animated face, moods, XP/level/bond, live stats, event log, network scanner, capture list, and settings. Bottom navigation: **FACE / SCAN / LOOT / SET**.
 - **On-device Wi-Fi setup** — scan from the device, pick an AP, type the password on the LVGL keyboard, and save credentials to NVS. Autoconnect is configurable.
 - **Setup AP fallback** — with no saved credentials, or after 30 seconds of failed station joins, the device starts an open `PWNI-Setup-XXXX` SoftAP at `http://192.168.4.1/` so the dashboard can be used to configure Wi-Fi. The AP is pinned to channel 1, channel hopping pauses, and the AP stops as soon as the station gets an IP. The setup AP has **no Wi-Fi password**; anyone in radio range can reach the dashboard while it is active, though the dashboard still requires `admin` / `ADMIN` Basic auth. Use it only long enough to join your own network.
-- **Web dashboard** — served on port 80 at `http://<device-ip>/` with live status, networks, clients, captures, PCAP download, attack controls, and settings.
+- **Web dashboard** — served on port 80 at `http://<device-ip>/` with live status, networks, clients, passive recon, captures, PCAP download, attack controls, and settings.
+- **Passive BLE observer** — opt-in NimBLE scanner (off by default) that records address/address type, name, RSSI, advertised service UUIDs, and common beacon types (iBeacon, Eddystone, AltBeacon, Exposure Notification, Fast Pair). It never connects, pairs, writes, or sends scan requests. Wi-Fi keeps coexistence priority; scanning pauses while the setup AP or a deauth burst owns the radio.
+- **Passive DNS / SNI / HTTP visibility** — parses DNS question names, TLS ClientHello SNI, and HTTP `Host` headers from unprotected 802.11 data frames, with bounded tables, counts, and timestamps. Only metadata is retained: no payloads, URLs, cookies, query answers, or credentials. WPA/WPA2/WPA3 traffic is encrypted and remains invisible.
+- **Client fingerprinting** — a small built-in OUI vendor table, locally-administered/randomized MAC detection, first/last-seen timestamps, and the last few unique probe-request SSIDs per client.
+- **Persistent watchlist** — add watched SSIDs, Wi-Fi MACs, or BLE addresses/names from the web UI. Matches are stored in NVS, raise a dashboard badge/toast, and appear in `/api/status` (`watch_*` fields plus `last_event`). Passive matching only.
 - **Host PCAP cracker** — `tools/pwn_crack.py` (alias `tools/crack.py`) auto-discovers the device, lists SD-backed handshakes, downloads PCAPs, and runs `aircrack-ng` with **rockyou.txt**, the **SecLists top-1M** list, or a custom wordlist. `tools/install_autostart.sh` starts it hidden at login and opens it when the device appears. See [tools/README.md](tools/README.md).
 - **Runtime-gated active attacks** — unlock with `ADMIN` (case-insensitive), then deauth from the device, web, or API. This workspace uses the patched C5 WiFi library, so frames are actually transmitted; stock ESP-IDF blocks them. Deauth runs as a configurable burst (5/8/15/30 s in web; 8 s on device) with **Stop** on both, shows **PMF** AP badges, and warns when PMF may make deauth ineffective. Locking and auto-deauth remain explicit user actions.
 - **Capture hunt** — a bounded, deauth-assisted handshake capture. Pick a target AP (and optionally one observed client) in the web **Attacks** tab or from the device AP detail sheet; the firmware sends a limited deauth burst, polls the capture table, and stops as soon as a complete 4-way handshake or PMKID is saved, or after 20 s. It never targets the device's own STA, skips broadcast for the AP the device is associated with, and reports PMF warnings.
@@ -52,7 +56,7 @@ Open the serial console at 115200 baud, or use `idf.py -p /dev/ttyACM0 monitor`.
 capture: SD card mounted, handshakes -> /sdcard/handshakes
 esp32_c5_touch_lcd_3_5: Touch ready: raw 320x480 swap=0 mirror_x=0 mirror_y=0
 esp_lvgl:touch: Touch input device registered successfully (IRQ mode: disabled)
-web: web UI listening on :80 (21 handlers)
+web: web UI listening on :80 (34 handlers)
 net: got IP <device-ip> — web UI: http://<device-ip>/
 ```
 
@@ -79,11 +83,13 @@ This connects immediately and saves the credentials to NVS. The password is not 
 
 ### Web dashboard
 
-Open `http://<device-ip>/` from a device on the same network. If the device is in setup mode, join the open `PWNI-Setup-XXXX` network and open `http://192.168.4.1/` instead; the dashboard shows a setup banner until the device joins your Wi-Fi. The dashboard has six tabs:
+Open `http://<device-ip>/` from a device on the same network. If the device is in setup mode, join the open `PWNI-Setup-XXXX` network and open `http://192.168.4.1/` instead; the dashboard shows a setup banner until the device joins your Wi-Fi. The dashboard has eight tabs:
 
-- **Dash** — mood, level, bond, reward, live AP/client/capture counts, channel, strategy, recent events.
+- **Dash** — mood, level, bond, reward, live AP/client/capture/BLE counts, channel, strategy, recent events.
 - **Nets** — nearby APs with SSID/BSSID/channel/RSSI/security; scan and connect.
-- **Clients** — observed stations with BSSID/RSSI.
+- **Clients** — observed stations with vendor/randomized flags, RSSI, probe history, first/last seen, plus the watchlist editor.
+- **BLE** — opt-in passive BLE scanner state and recent advertisers (address type, name, RSSI, service UUIDs, beacon type).
+- **Net intel** — recent DNS queries, TLS SNI hosts, HTTP `Host` headers, and top talkers.
 - **Caps** — captured handshakes and PMKIDs from this session, plus a **Saved PCAPs** table read from the SD card (survives reboots), with PCAP download.
 - **Attack** — authorization state, deauthentication, capture hunt, auto-deauth, pause/hop controls.
 - **Set** — Wi-Fi connection, display brightness, maintenance, system information.
@@ -96,7 +102,14 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 |---|---|---|
 | GET | `/api/status` | Firmware, uptime, heap, pet, radio, SD, network, and build info |
 | GET | `/api/aps` | Access-point table |
-| GET | `/api/clients` | Observed client table (unicast only) |
+| GET | `/api/clients` | Observed client table with vendor, randomized flag, probes, first/last seen |
+| GET | `/api/ble` | Passive BLE state and recent advertisers |
+| POST | `/api/ble` | Enable/disable passive BLE scanning (`{"enabled":true}`) |
+| GET | `/api/dns` | Recent DNS question names with counts and timestamps |
+| GET | `/api/sni` | Recent TLS ClientHello SNI hosts with counts and timestamps |
+| GET | `/api/network` | Combined DNS/SNI/HTTP metadata plus top talkers |
+| GET | `/api/watch` | Persistent watchlist, hit count, and last alert |
+| POST | `/api/watch` | Add/remove watched values (`action`, `type`, `value`) or `{"clear":true}` |
 | GET | `/api/hs` | Captured handshakes / PMKIDs plus saved PCAP files |
 | GET | `/api/pcap?name=<file>` | Download a PCAP from `/sdcard/handshakes/` |
 | GET | `/api/hs_meta?name=<file>` | Download the JSON sidecar for a saved PCAP |
@@ -119,6 +132,8 @@ All responses are JSON unless noted. `POST` bodies use `Content-Type: applicatio
 The authorization phrase is `ADMIN` and matching is case-insensitive. The phrase is a deliberate speed bump, not a security boundary. `ADMIN` is intentionally weak and guessable; change `PWN_AUTH_PHRASE` in `main/pwn_config.h` if the device is accessible to others. Auto-deauth defaults to off. Deauth starts an 8-second burst and returns immediately; send `{"stop":true}` to stop it. Deauth and hop calls that need an exclusive radio return `409 Conflict` while associated.
 
 `POST /api/hunt` returns immediately with `started`, the target `bssid`/`sta`, `duration_ms`, and a PMF `warning` when relevant. `/api/status` exposes `hunt_active`, `hunt_result` (`idle`, `hunting`, `captured`, `timeout`, `stopped`, `error`), `hunt_bssid`, `hunt_sta`, `hunt_elapsed_ms`, `hunt_duration_ms`, `hunt_file`, and `hunt_message`. The deauth burst is stopped as soon as a complete 4-way handshake or PMKID is saved for the target, or when the duration expires; hunts require the same runtime unlock as deauth.
+
+Passive recon is always receive-only. `/api/ble` reports `supported`, `enabled`, `scanning`, `gated`, and a bounded `devices` table; scanning is off after boot until explicitly enabled, and pauses when `ap_active`/`setup_mode` or a deauth burst is using the radio. `/api/dns`, `/api/sni`, and `/api/network` contain names, counts, and uptime-based `first_seen_ms`/`last_seen_ms` only; they cannot see WPA/WPA2/WPA3-encrypted payloads. `/api/watch` accepts `type` values `ssid`, `mac`, and `ble` (BLE address or advertised name). Matches are stored in NVS and reported through `/api/status` as `watch_count`, `watch_hits`, `watch_last`, and `watch_age_ms`; a recent match also replaces `last_event` for 60 seconds so it is visible to simple pollers.
 
 `/api/status` also exposes network state: `connected`, `connecting`, `have_creds`, `autoconnect`, `ssid`, `ip`, `rssi`, `sta_channel`, and the setup fallback fields `setup_mode`, `ap_active`, `ap_ssid`, and `ap_ip`. When `setup_mode` is true, use the existing Settings Wi-Fi panel at `http://192.168.4.1/`; submitting valid credentials starts a station join and the AP is removed once an IP is obtained.
 
@@ -178,6 +193,9 @@ Key settings live in [`main/pwn_config.h`](main/pwn_config.h):
 - `PWN_AUTH_PHRASE` — the runtime unlock phrase. Matching is case-insensitive across the UI, CLI, and web.
 - `PWN_COUNTRY` — regulatory domain; defaults to `US`. Change it to your country.
 - `PWN_EPOCH_MS`, `PWN_MAX_APS`, `PWN_MAX_CLIENTS`, `PWN_MAX_HS`, `PWN_RB_BYTES` — behavior and table sizing.
+- Passive recon tables are fixed at compile time: `PWN_DNS_MAX`, `PWN_HOST_MAX`, `PWN_TALKER_MAX` in `main/pwn_netmeta.h`, `PWN_BLE_MAX` in `main/pwn_ble.h`, and `PWN_WATCH_MAX` in `main/pwn_watch.h`. The AP/client/BLE tables and large web snapshots live in PSRAM.
+
+Build defaults include the NimBLE observer role only (`CONFIG_BT_NIMBLE_ENABLED=y`, observer on, central/peripheral/broadcaster/security/GATT off). BLE scanning itself remains a runtime opt-in and starts **off** after every boot; `/api/ble` or the web **BLE** tab enables it for the current session. If you need a smaller image with no Bluetooth at all, remove the `bt`/`esp_coex` requirements and the BLE source from `main/CMakeLists.txt` and the `CONFIG_BT_*` block from `sdkconfig.defaults`; the web API then reports `ble_supported: false`.
 
 Build defaults live in [`sdkconfig.defaults`](sdkconfig.defaults): ESP-IDF 5.5, `esp32c5`, 32 MB flash, 8 MB quad PSRAM at 80 MHz, 80 MHz QIO flash, LVGL 9 with Montserrat/UNSCII fonts, USB-Serial/JTAG console, FATFS long filenames, and the web-server socket limits.
 
@@ -210,6 +228,10 @@ main/
 ├── pwn_hunt.*          # Bounded deauth-assisted capture task
 ├── pwn_wifi.*          # Sniffer, AP/client tables, scan, hopping, deauth, selftest
 ├── pwn_net.*           # STA manager, setup SoftAP fallback, NVS credentials, channel lock
+├── pwn_watch.*         # Persistent SSID/MAC/BLE watchlist and alert cooldown
+├── pwn_netmeta.*       # Passive DNS/SNI/HTTP metadata and top-talker counters
+├── pwn_ble.*           # Opt-in passive NimBLE observer
+├── pwn_oui.*           # Small built-in OUI vendor table / randomized-MAC bit
 ├── pwn_web.*           # HTTP server, JSON APIs, PCAP download
 ├── pwn_web_page.h      # Embedded dashboard HTML/JS/CSS
 ├── pwn_pet.*           # Moods, XP/bond, epochs, reward, learning loop
@@ -229,6 +251,9 @@ docs/                   # Hardware, architecture, legal notes
 - **Wi-Fi will not connect** — verify the password and security mode. The device scans 2.4 GHz and 5 GHz; the station connects on the AP's channel. Watch the serial log for the disconnect reason. After 30 seconds without a connection the device starts the open `PWNI-Setup-XXXX` SoftAP; join it and open `http://192.168.4.1/` to fix the credentials. The AP stops when the station gets an IP.
 - **Setup AP is visible but you do not want it** — it appears only with no saved credentials or after a failed join window, and it is removed as soon as the station connects. Save valid credentials from the dashboard's **Settings → WiFi connection** panel (or the device **SET** screen). There is no separate setup password, so keep the setup window short.
 - **UI freezes during heavy SD activity** — SD and LCD share SPI2; the firmware serializes access, but a failing card can still stall. Remove the card and reboot to confirm.
+- **BLE tab stays empty** — BLE scanning is opt-in and off after every boot. Enable it in the **BLE** tab or with `POST /api/ble {"enabled":true}`. If `gated` is true, the setup AP or an active deauth burst owns the radio; wait for it to finish. `supported: false` means the firmware was built without NimBLE.
+- **BLE scanning pauses or feels slow** — Wi-Fi and BLE share the 2.4 GHz radio. The firmware sets Wi-Fi coexistence priority and uses a low-duty passive scan; expect fewer advertisers than a dedicated BLE scanner. If you see Wi-Fi drops while BLE is on, leave BLE off; it is not required for any other feature.
+- **DNS/SNI/HTTP tables stay empty on a WPA2/WPA3 network** — expected. Those payloads are encrypted; the parser only sees unprotected frames (open networks or unencrypted management/data). It stores names and counters only, never payloads or credentials.
 - **Deauth returns 403** — active attacks are locked. Unlock with `ADMIN` (case-insensitive) in `SET`, the CLI, or `/api/auth`. While associated, deauth/hop requests that need an exclusive radio return `409`.
 - **Deauth says `0 frames` or `tx_error: ESP_ERR_INVALID_ARG`** — you are unlocked, but the C5 Wi-Fi library is refusing the frame. Run `python3 tools/patch_c5_deauth.py --check`. If it says `STOCK`, apply the patch (`--apply`), run `idf.py fullclean && idf.py build`, and reflash. If it says `PATCHED`, the target is on another channel while associated (disconnect first), the BSSID/station is invalid, or the client uses protected management frames (PMF). See [docs/C5_DEAUTH.md](docs/C5_DEAUTH.md).
 - **The deauth burst works but the client comes back after 8 seconds** — that is the burst ending. Run it again, use a longer `duration_ms`, or target the client from the Clients tab for a per-client burst. PMF clients ignore unprotected deauth entirely.

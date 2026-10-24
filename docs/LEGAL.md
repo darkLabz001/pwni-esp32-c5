@@ -13,6 +13,17 @@
 
 Passive reception of radio traffic is still regulated in many places, and captured frames can contain personal data (MAC addresses, SSIDs, device fingerprints, and sometimes handshake material). Treat capture files as sensitive.
 
+## Passive recon
+
+The BLE scanner, DNS/SNI/HTTP parser, client fingerprinting, and watchlist are receive-only:
+
+- BLE uses passive advertisements. It never connects, pairs, writes, or sends scan requests.
+- The network metadata parser stores DNS question names, TLS SNI, and HTTP `Host` headers plus counters/timestamps. It does **not** store payloads, URLs, cookies, query answers, or credentials. WPA/WPA2/WPA3 data frames are encrypted and are not decrypted.
+- Client fingerprinting stores MAC addresses, a small OUI vendor label, a randomized-MAC flag, timestamps, and the last few probe-request SSIDs. Probe requests and BLE advertisements can reveal personal habits or device presence even though no payload is captured.
+- The watchlist is a local convenience feature. It does not transmit anything; it only marks matches in the dashboard and status API.
+
+Even passive metadata can be personal data under privacy laws. Use the feature only where you have a lawful basis, keep the device on networks you control, and delete watchlists/PCAPs when they are no longer needed. Do not publish observed SSIDs, MAC addresses, BLE device names, or hostnames without consent.
+
 ## Active deauthentication
 
 This build compiles the active-deauth path in (`PWN_ENABLE_DEAUTH=1`) so the UI and API can expose it after an explicit unlock. It is **not** enabled by default at runtime:
@@ -58,7 +69,7 @@ Interference with radio communications can carry separate civil and criminal pen
 
 - PCAPs can contain MAC addresses, SSIDs, probe requests, and handshake frames. They may be personal data under privacy laws.
 - Store captures on a trusted SD card, encrypt or delete them when no longer needed, and do not publish them without consent.
-- The web dashboard has no login. Anyone who can reach the device's IP on the network can read its status and captures. Use a trusted network, change the Wi-Fi password, or keep the device off untrusted networks.
+- The web dashboard uses HTTP Basic auth (`admin` / `ADMIN` by default) but is plain HTTP on the LAN. Anyone who can reach the device's IP and knows/guesses the phrase can read its status, metadata tables, watchlist, and captures. Use a trusted network, change the phrase, or keep the device off untrusted networks.
 - The CLI and web API can reboot the device and change settings. Treat physical and network access accordingly.
 
 ## Safety
